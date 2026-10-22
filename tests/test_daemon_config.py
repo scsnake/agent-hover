@@ -1,0 +1,25 @@
+import argparse
+
+from agent_hover import daemon
+
+
+def args(**kw):
+    base = {"n": None, "idle_min": None, "working_park_s": None}
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_defaults_without_config():
+    a = args()
+    daemon.apply_config(a, {})
+    assert (a.n, a.idle_min, a.working_park_s) == (5, 20.0, 120.0)
+
+
+def test_config_then_flag_wins(monkeypatch):
+    monkeypatch.setattr(daemon, "AGENTS", ["claude", "codex"])
+    a = args(n=3)
+    daemon.apply_config(a, {"daemon": {"n_active": 8, "idle_min": 5, "working_park_s": "bad"},
+                            "agents": {"extra": ["qwen", "claude", 7]}})
+    assert (a.n, a.idle_min, a.working_park_s) == (3, 5, 120.0)
+    assert daemon.AGENTS == ["claude", "codex", "qwen"]
+    assert daemon.detect_agent("qwen", "") == "qwen"

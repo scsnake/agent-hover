@@ -1,0 +1,13 @@
+[project]
+name = "agent-hover"
+version = "0.1.0"
+description = "Floating panel and iTerm2 tab manager for AI coding agents (Claude Code, Codex)"
+requires-python = ">=3.11"
+dependencies = ["iterm2>=2.30"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

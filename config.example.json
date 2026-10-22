@@ -1,0 +1,14 @@
+{
+  "panel": {
+    "font_size": 12,
+    "list_width": 440
+  },
+  "daemon": {
+    "n_active": 5,
+    "idle_min": 20,
+    "working_park_s": 120
+  },
+  "agents": {
+    "extra": []
+  }
+}
