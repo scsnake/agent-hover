@@ -109,7 +109,7 @@
 
 ```json
 {
-  "panel":  {"font_size": 12, "list_width": 440},
+  "panel":  {"font_size": 12, "list_width": 440, "hover_ms": 120},
   "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120},
   "agents": {"extra": []}
 }
@@ -117,6 +117,7 @@
 
 - `panel` 的變更 1 秒內生效。`daemon` 的變更要執行 `./run.sh stop` 與 `./run.sh start --apply` 後才生效。
 - 命令列參數會覆蓋設定檔，例如 `./run.sh start --apply --n 8`。
+- `panel.hover_ms`：游標要在膠囊或邊條上停留這麼久（毫秒）清單才展開，只是經過的游標不會打開它。預設 120。`0` 表示立刻展開。
 - `agents.extra`：要額外辨識的程式名稱（例如 `qwen`）。這類代理也需要設定 hook，以 Claude 格式的事件呼叫 `agent_hover/hook.py <名稱>`。
 - 代理標記：`~/.agent-hover/agents.json`，例如 `{"codex": {"mark": "◇", "color": "#10A37F"}}`。
 

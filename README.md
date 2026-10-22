@@ -109,7 +109,7 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 
 ```json
 {
-  "panel":  {"font_size": 12, "list_width": 440},
+  "panel":  {"font_size": 12, "list_width": 440, "hover_ms": 120},
   "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120},
   "agents": {"extra": []}
 }
@@ -117,6 +117,7 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 
 - `panel` changes apply within 1 s. `daemon` changes apply after `./run.sh stop` and `./run.sh start --apply`.
 - A command-line flag overrides the file, for example `./run.sh start --apply --n 8`.
+- `panel.hover_ms`: the cursor must rest on the pill or bar this long (in ms) before the list opens, so a cursor that only passes over it does not open it. Default 120. `0` opens at once.
 - `agents.extra`: more job names to find (for example `qwen`). Such an agent also needs hooks that call `agent_hover/hook.py <name>` with Claude-style events.
 - Agent marks: `~/.agent-hover/agents.json`, for example `{"codex": {"mark": "◇", "color": "#10A37F"}}`.
 

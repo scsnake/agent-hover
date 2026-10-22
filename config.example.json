@@ -1,7 +1,8 @@
 {
   "panel": {
     "font_size": 12,
-    "list_width": 440
+    "list_width": 440,
+    "hover_ms": 120
   },
   "daemon": {
     "n_active": 5,

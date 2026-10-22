@@ -1,12 +1,13 @@
 // agent-hover hover panel (POC 2).
 //
 // A small pill in the top-right corner (draggable) shows counts of agent tabs.
-// Hover: it expands to a list of all agent tabs, most recently active first (buried ones are
-// dimmed and marked ▾). The order is sorted when the list opens and stays while it is open.
+// Hover (the cursor rests on it for panel.hover_ms): it expands to a list of all agent tabs,
+// most recently active first (buried ones are dimmed and marked ▾). The order is sorted when
+// the list opens and stays while it is open.
 // Each row has an agent mark (built-in table, overridden by ~/.agent-hover/agents.json).
-// Edge bar: drag the pill to the right edge of the screen: the panel becomes a thin bar in the
-// color of the most urgent state (waiting > done > working); hover the bar for the full panel;
-// drag the pill away from the edge to undock.
+// Edge bar: drag the pill to the right edge of the screen (an accent border shows the dock zone)
+// and release: the panel becomes a thin bar in the color of the most urgent state
+// (waiting > done > working); hover the bar for the full panel; drag the pill away to undock.
 // Search: the magnifier on the open list starts search mode: the panel takes the keyboard and
 // filters the rows by tab name and agent folder; the "chat" switch also searches the chat text
 // (agent_hover/search.py). Esc, a click outside or a click on a row ends it; Enter raises the first row.
@@ -105,6 +106,7 @@ struct Snapshot: Decodable {
 // Sizes follow config.json "panel": {"font_size": 12, "list_width": 440}; 12 is the base size.
 var fontSize: CGFloat = 12
 var listWidth: CGFloat = 440
+var hoverMs: Double = 120  // hover intent: the cursor must rest this long before the list opens
 func fs(_ base: CGFloat) -> CGFloat { (base * fontSize / 12).rounded() }
 var pillHeight: CGFloat { fs(26) }
 var rowHeight: CGFloat { fs(22) }
@@ -121,6 +123,9 @@ func reloadPanelConfig() -> Bool {
        let panelCfg = obj["panel"] as? [String: Any] {
         if let v = panelCfg["font_size"] as? Double { size = CGFloat(min(24, max(9, v))) }
         if let v = panelCfg["list_width"] as? Double { width = CGFloat(min(1200, max(280, v))) }
+        hoverMs = min(1000, max(0, panelCfg["hover_ms"] as? Double ?? 120))
+    } else {
+        hoverMs = 120
     }
     let changed = size != fontSize || width != listWidth
     fontSize = size
@@ -205,6 +210,7 @@ final class Panel: NSPanel {
 /// a click (no move) raises the pill's tab.
 final class PillView: NSView {
     var content = NSAttributedString()
+    var onDragMove: (() -> Void)?
     var onDragEnd: (() -> Void)?
     var onClick: (() -> Void)?
 
@@ -225,7 +231,10 @@ final class PillView: NSView {
         while let e = win.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
             let p = NSEvent.mouseLocation
             if !moved && hypot(p.x - start.x, p.y - start.y) > 3 { moved = true }
-            if moved { win.setFrameOrigin(NSPoint(x: origin.x + p.x - start.x, y: origin.y + p.y - start.y)) }
+            if moved {
+                win.setFrameOrigin(NSPoint(x: origin.x + p.x - start.x, y: origin.y + p.y - start.y))
+                onDragMove?()
+            }
             if e.type == .leftMouseUp { break }
         }
         if moved { onDragEnd?() } else { onClick?() }
@@ -358,6 +367,11 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     var watchTimer: Timer?
     var outsideSince: Date?
     var inLayout = false  // our own setFrame moves the panel too: not a drag
+    var animating = false  // the dock animation moves the panel: do not save those positions
+    var intentTimer: Timer?
+    var intentStart = Date()
+    var intentSamples: [(t: Date, p: NSPoint)] = []
+    var hoverBlocked = false  // just docked under the cursor: do not open until the cursor leaves the bar
     var order: [String: Int] = [:]  // row position by session, kept while the list is open
     var pillRow: Row?  // the tab the pill shows; a click on the pill raises it
     // A pin or unpin shows at once: kept here until panel.json agrees (or 5 s pass).
@@ -403,6 +417,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         root.layer?.cornerRadius = 9
         root.layer?.masksToBounds = true
         root.onHover = { [weak self] inside in self?.hover(inside) }
+        pill.onDragMove = { [weak self] in self?.dragMoved() }
         pill.onDragEnd = { [weak self] in self?.dragEnded() }
         pill.onClick = { [weak self] in
             if let self = self, let r = self.pillRow { self.raise(r) }
@@ -410,7 +425,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         // performDrag can return before the move ends, so also save on each window move.
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: .main) {
             [weak self] _ in
-            guard let self = self, !self.inLayout else { return }
+            guard let self = self, !self.inLayout, !self.animating else { return }
             self.savePosition()
         }
         panel.contentView = root
@@ -454,15 +469,47 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         return NSPoint(x: f.maxX - 8, y: f.maxY - 8)
     }
 
-    /// A drag ended: dock when the panel's right side is within 12 px of the screen's right edge.
+    /// Dock zone: the panel's right side is within 12 px of the screen's right edge.
+    func inDockZone() -> Bool {
+        guard let vis = (panel.screen ?? NSScreen.main)?.visibleFrame else { return false }
+        return panel.frame.maxX >= vis.maxX - 12
+    }
+
+    /// During a drag: an accent border tells that a release here docks the panel.
+    func dragMoved() {
+        let zone = inDockZone()
+        root.layer?.borderWidth = zone ? 2 : 0
+        root.layer?.borderColor = NSColor.controlAccentColor.cgColor
+    }
+
+    /// A drag ended: in the dock zone, the panel shrinks into the edge bar at once
+    /// (no wait for the cursor to leave); elsewhere it stays where it was dropped.
     func dragEnded() {
+        root.layer?.borderWidth = 0
         savePosition()
-        if let vis = (panel.screen ?? NSScreen.main)?.visibleFrame {
-            docked = panel.frame.maxX >= vis.maxX - 12
-            if docked { anchor.x = vis.maxX }
-        }
+        docked = inDockZone()
+        if docked, let vis = (panel.screen ?? NSScreen.main)?.visibleFrame { anchor.x = vis.maxX }
         savePosition(keepAnchor: true)
+        if !docked { layout(); return }
+        if searchMode { endSearch() }
+        hidePreview()
+        watchTimer?.invalidate()
+        watchTimer = nil
+        expanded = alwaysExpanded
+        order = [:]
+        let from = panel.frame
         layout()
+        let to = panel.frame
+        hoverBlocked = to.contains(NSEvent.mouseLocation)
+        // Slide into the edge, so the eye sees where the panel went.
+        animating = true
+        inLayout = true
+        panel.setFrame(from, display: false)
+        inLayout = false
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            panel.animator().setFrame(to, display: true)
+        }, completionHandler: { [weak self] in self?.animating = false })
     }
 
     /// The bar's color: the most urgent state among the shown tabs.
@@ -493,7 +540,40 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     // Enter expands. Leaving is found by polling the cursor while the list is open:
     // the exit event can be lost when the panel resizes or rebuilds its rows under the cursor.
     func hover(_ inside: Bool) {
-        if alwaysExpanded || !inside || expanded { return }
+        if !inside { hoverBlocked = false }
+        if alwaysExpanded || !inside || expanded || hoverBlocked { return }
+        if hoverMs <= 0 { expand(); return }
+        guard intentTimer == nil else { return }
+        intentStart = Date()
+        intentSamples = []
+        intentTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
+            self?.checkIntent()
+        }
+    }
+
+    /// Hover intent: open when the cursor rests on the panel (moves less than 4 px in hover_ms),
+    /// or stays on it for 3 × hover_ms. A cursor that only passes over (for example to a menu
+    /// bar icon) does not open the list.
+    func checkIntent() {
+        let p = NSEvent.mouseLocation, now = Date()
+        guard panel.frame.contains(p), !expanded, !hoverBlocked else { stopIntent(); return }
+        let window = hoverMs / 1000
+        intentSamples.append((now, p))
+        intentSamples.removeAll { now.timeIntervalSince($0.t) > window }
+        let inside = now.timeIntervalSince(intentStart)
+        let rested = inside >= window && intentSamples.allSatisfy { hypot($0.p.x - p.x, $0.p.y - p.y) < 4 }
+        if rested || inside >= window * 3 {
+            stopIntent()
+            expand()
+        }
+    }
+
+    func stopIntent() {
+        intentTimer?.invalidate()
+        intentTimer = nil
+    }
+
+    func expand() {
         expanded = true
         layout()
         outsideSince = nil
@@ -817,6 +897,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     }
 
     func refresh() {
+        if hoverBlocked && !panel.frame.contains(NSEvent.mouseLocation) { hoverBlocked = false }  // lost exit event
         if let data = try? Data(contentsOf: panelFile) {
             snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
         }
