@@ -109,7 +109,8 @@
 
 ```json
 {
-  "panel":  {"font_size": 12, "list_width": 440, "hover_ms": 120},
+  "panel":  {"font_size": 12, "list_width": 440, "hover_ms": 120,
+             "hotkey": "ctrl+opt+space", "fold_idle_h": 12},
   "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120},
   "agents": {"extra": []}
 }
@@ -118,6 +119,8 @@
 - `panel` 的變更 1 秒內生效。`daemon` 的變更要執行 `./run.sh stop` 與 `./run.sh start --apply` 後才生效。
 - 命令列參數會覆蓋設定檔，例如 `./run.sh start --apply --n 8`。
 - `panel.hover_ms`：游標要在膠囊或邊條上停留這麼久（毫秒）清單才展開，只是經過的游標不會打開它。預設 120。`0` 表示立刻展開。
+- `panel.hotkey`：在任何 App 中按下，以搜尋模式打開清單，在其他桌面空間也可以。再按一次關閉。修飾鍵：`ctrl`、`opt`、`cmd`、`shift`；按鍵：字母、數字、`space`、`return`、`tab`、`f1`–`f12` 與部分標點。`"off"` 表示關閉。如果沒有反應，很可能有其他 App 用了同一組按鍵（例如 Alfred 或 Raycast 的 `opt+space`）。
+- `panel.fold_idle_h`：已完成或閒置超過這麼多小時的分頁，會收合成清單最後的一行。游標停在這一行上，或點它，就會展開。釘選的分頁、新的（還沒看過的）分頁與搜尋結果不會收合。`0` 表示關閉。
 - `agents.extra`：要額外辨識的程式名稱（例如 `qwen`）。這類代理也需要設定 hook，以 Claude 格式的事件呼叫 `agent_hover/hook.py <名稱>`。
 - 代理標記：`~/.agent-hover/agents.json`，例如 `{"codex": {"mark": "◇", "color": "#10A37F"}}`。
 

@@ -12,6 +12,8 @@
 // filters the rows by tab name and agent folder; the "chat" switch also searches the chat text
 // (agent_hover/search.py). Esc, a click outside or a click on a row ends it; Enter raises the first row.
 // Click a row: ask the daemon to raise that tab (unbury, select, bring iTerm2 front).
+// Hotkey (panel.hotkey, default ctrl+opt+space): open the list in search mode from anywhere.
+// Stale tabs (done or idle for more than panel.fold_idle_h hours) fold into one line at the end.
 //
 // Data: reads ~/.agent-hover/panel.json (written by the daemon each second).
 // Clicks: writes ~/.agent-hover/requests/<uuid>.json (the daemon handles it within 0.2 s).
@@ -20,6 +22,7 @@
 // Build: swiftc -O -swift-version 5 panel/AgentHoverPanel.swift -o .build/agent-hover-panel
 
 import AppKit
+import Carbon.HIToolbox
 
 let home: URL = {
     if let h = ProcessInfo.processInfo.environment["AGENT_HOVER_HOME"], !h.isEmpty {
@@ -107,6 +110,8 @@ struct Snapshot: Decodable {
 var fontSize: CGFloat = 12
 var listWidth: CGFloat = 440
 var hoverMs: Double = 120  // hover intent: the cursor must rest this long before the list opens
+var hotkeySpec = "ctrl+opt+space"  // "" or "off": no hotkey
+var foldIdleH: Double = 12  // 0: never fold
 func fs(_ base: CGFloat) -> CGFloat { (base * fontSize / 12).rounded() }
 var pillHeight: CGFloat { fs(26) }
 var rowHeight: CGFloat { fs(22) }
@@ -124,8 +129,12 @@ func reloadPanelConfig() -> Bool {
         if let v = panelCfg["font_size"] as? Double { size = CGFloat(min(24, max(9, v))) }
         if let v = panelCfg["list_width"] as? Double { width = CGFloat(min(1200, max(280, v))) }
         hoverMs = min(1000, max(0, panelCfg["hover_ms"] as? Double ?? 120))
+        hotkeySpec = panelCfg["hotkey"] as? String ?? "ctrl+opt+space"
+        foldIdleH = max(0, panelCfg["fold_idle_h"] as? Double ?? 12)
     } else {
         hoverMs = 120
+        hotkeySpec = "ctrl+opt+space"
+        foldIdleH = 12
     }
     let changed = size != fontSize || width != listWidth
     fontSize = size
@@ -335,6 +344,104 @@ final class RowView: NSView {
     }
 }
 
+/// A global hotkey. Carbon's RegisterEventHotKey needs no Accessibility permission.
+final class HotKey {
+    static var action: (() -> Void)?
+    private static var handlerInstalled = false
+    private var ref: EventHotKeyRef?
+
+    static let keyCodes: [String: Int] = [
+        "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E, "f": kVK_ANSI_F,
+        "g": kVK_ANSI_G, "h": kVK_ANSI_H, "i": kVK_ANSI_I, "j": kVK_ANSI_J, "k": kVK_ANSI_K, "l": kVK_ANSI_L,
+        "m": kVK_ANSI_M, "n": kVK_ANSI_N, "o": kVK_ANSI_O, "p": kVK_ANSI_P, "q": kVK_ANSI_Q, "r": kVK_ANSI_R,
+        "s": kVK_ANSI_S, "t": kVK_ANSI_T, "u": kVK_ANSI_U, "v": kVK_ANSI_V, "w": kVK_ANSI_W, "x": kVK_ANSI_X,
+        "y": kVK_ANSI_Y, "z": kVK_ANSI_Z,
+        "0": kVK_ANSI_0, "1": kVK_ANSI_1, "2": kVK_ANSI_2, "3": kVK_ANSI_3, "4": kVK_ANSI_4,
+        "5": kVK_ANSI_5, "6": kVK_ANSI_6, "7": kVK_ANSI_7, "8": kVK_ANSI_8, "9": kVK_ANSI_9,
+        "space": kVK_Space, "return": kVK_Return, "enter": kVK_Return, "tab": kVK_Tab,
+        "`": kVK_ANSI_Grave, "-": kVK_ANSI_Minus, "=": kVK_ANSI_Equal, "/": kVK_ANSI_Slash,
+        ".": kVK_ANSI_Period, ",": kVK_ANSI_Comma, ";": kVK_ANSI_Semicolon, "'": kVK_ANSI_Quote,
+        "[": kVK_ANSI_LeftBracket, "]": kVK_ANSI_RightBracket, "\\": kVK_ANSI_Backslash,
+        "f1": kVK_F1, "f2": kVK_F2, "f3": kVK_F3, "f4": kVK_F4, "f5": kVK_F5, "f6": kVK_F6,
+        "f7": kVK_F7, "f8": kVK_F8, "f9": kVK_F9, "f10": kVK_F10, "f11": kVK_F11, "f12": kVK_F12,
+    ]
+    static let modifiers: [String: Int] = [
+        "ctrl": controlKey, "control": controlKey, "opt": optionKey, "option": optionKey, "alt": optionKey,
+        "cmd": cmdKey, "command": cmdKey, "shift": shiftKey,
+    ]
+
+    /// "ctrl+opt+space" -> (key code, Carbon modifiers). nil if not understood, or if a plain
+    /// key (not F1–F12) has no modifier: that would take the key from every app.
+    static func parse(_ spec: String) -> (UInt32, UInt32)? {
+        let parts = spec.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let keyName = parts.last, let code = keyCodes[keyName] else { return nil }
+        var mods = 0
+        for m in parts.dropLast() {
+            guard let v = modifiers[m] else { return nil }
+            mods |= v
+        }
+        if mods == 0 && !keyName.hasPrefix("f") { return nil }
+        return (UInt32(code), UInt32(mods))
+    }
+
+    /// Register spec (replacing the old hotkey). false if the text is not understood or the
+    /// system refuses it.
+    func register(_ spec: String) -> Bool {
+        unregister()
+        guard let (code, mods) = HotKey.parse(spec) else { return false }
+        if !HotKey.handlerInstalled {
+            var type = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+                DispatchQueue.main.async { HotKey.action?() }
+                return noErr
+            }, 1, &type, nil, nil)
+            HotKey.handlerInstalled = true
+        }
+        let id = EventHotKeyID(signature: OSType(0x41484B31), id: 1)
+        return RegisterEventHotKey(code, mods, id, GetApplicationEventTarget(), 0, &ref) == noErr
+    }
+
+    func unregister() {
+        if let r = ref { UnregisterEventHotKey(r) }
+        ref = nil
+    }
+}
+
+/// The last line of the list: "▸ 5 stale (idle > 12 h)". Hover (the cursor rests on it for
+/// hover_ms; Controller.checkFoldHover) shows those rows; a click shows or hides them.
+final class FoldView: NSView {
+    let count: Int
+    let open: Bool
+    let onClick: () -> Void
+    private var hover = false
+
+    init(count: Int, open: Bool, frame: NSRect, onClick: @escaping () -> Void) {
+        self.count = count
+        self.open = open
+        self.onClick = onClick
+        super.init(frame: frame)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseEntered(with event: NSEvent) { hover = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hover = false; needsDisplay = true }
+    override func mouseDown(with event: NSEvent) { onClick() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hover {
+            NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
+        }
+        let hours = foldIdleH == foldIdleH.rounded() ? "\(Int(foldIdleH))" : "\(foldIdleH)"
+        let label = text("\(open ? "▾" : "▸")  \(count) stale (idle > \(hours) h)", infoColor, size: 11)
+        label.draw(at: NSPoint(x: pad + fs(14), y: (bounds.height - label.size().height) / 2))
+    }
+}
+
 /// Root view: hover anywhere on the panel expands it.
 final class RootView: NSVisualEffectView {
     var onHover: ((Bool) -> Void)?
@@ -371,6 +478,11 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     var intentTimer: Timer?
     var intentStart = Date()
     var intentSamples: [(t: Date, p: NSPoint)] = []
+    let hotKey = HotKey()
+    var hotkeyRegistered: String?  // the spec now registered (nil: none yet)
+    var foldOpen = false  // the stale rows are shown (until the list closes)
+    var foldView: FoldView?
+    var foldHoverSince: Date?
     var hoverBlocked = false  // just docked under the cursor: do not open until the cursor leaves the bar
     var order: [String: Int] = [:]  // row position by session, kept while the list is open
     var pillRow: Row?  // the tab the pill shows; a click on the pill raises it
@@ -449,6 +561,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
                 self?.checkOutside()
             }
         }
+        HotKey.action = { [weak self] in self?.hotkeyPressed() }
         refresh()
         applyForcedSearch()
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -586,12 +699,30 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     func checkOutside() {
         if alwaysExpanded && previewForced { updatePreview(); return }
         if searchMode { updatePreview(); return }  // typing: keep the list open
-        if panel.frame.contains(NSEvent.mouseLocation) { outsideSince = nil; updatePreview(); return }
+        if panel.frame.contains(NSEvent.mouseLocation) { outsideSince = nil; checkFoldHover(); updatePreview(); return }
         hidePreview()
         if alwaysExpanded { return }
         let now = Date()
         if outsideSince == nil { outsideSince = now }
         if now.timeIntervalSince(outsideSince!) >= 0.4 { collapse() }
+    }
+
+    /// Polled (not a timer in the fold line): the list rebuilds each second and would drop it.
+    func checkFoldHover() {
+        // The same hit test as updatePreview: the cursor in list coordinates, inside the scroll view.
+        let inWindow = panel.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let onList = scroll.bounds.contains(scroll.convert(inWindow, from: nil))
+        guard let f = foldView, !foldOpen, onList, f.frame.contains(listView.convert(inWindow, from: nil)) else {
+            foldHoverSince = nil
+            return
+        }
+        let now = Date()
+        if foldHoverSince == nil { foldHoverSince = now }
+        if now.timeIntervalSince(foldHoverSince!) >= max(0.15, hoverMs / 1000) {
+            foldHoverSince = nil
+            foldOpen = true
+            layout()
+        }
     }
 
     func collapse() {
@@ -601,6 +732,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         watchTimer = nil
         expanded = alwaysExpanded
         order = [:]
+        foldOpen = false
         layout()
     }
 
@@ -902,7 +1034,14 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
         }
         reloadAgentMarks()
-        if reloadPanelConfig() {
+        let layoutChanged = reloadPanelConfig()
+        if hotkeySpec != hotkeyRegistered {
+            hotkeyRegistered = hotkeySpec
+            let off = ["", "off", "none"].contains(hotkeySpec.lowercased())
+            if off { hotKey.unregister() }
+            else if !hotKey.register(hotkeySpec) { FileHandle.standardError.write("hotkey not set: \(hotkeySpec)\n".data(using: .utf8)!) }
+        }
+        if layoutChanged {
             for v in [searchField, chatToggle, searchStatus] as [NSControl] {
                 v.font = v === searchField ? NSFont.systemFont(ofSize: fs(12)) : NSFont.systemFont(ofSize: fs(11))
             }
@@ -919,7 +1058,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         let show = onFirstSpace(of: screen) ?? true
         if show && (!panel.isVisible || !panel.isOnActiveSpace) {
             panel.orderFrontRegardless()
-        } else if !show && panel.isVisible {
+        } else if !show && panel.isVisible && !searchMode {  // a search from the hotkey stays
             if expanded { collapse() }
             panel.orderOut(nil)
         }
@@ -979,16 +1118,23 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         let pillW = max(90, pill.content.size().width + pad * 2 + 6)
         rowViews.forEach { $0.removeFromSuperview() }
         rowViews = []
+        foldView?.removeFromSuperview()
+        foldView = nil
         let all = expanded && fresh ? sorted(rowsWithPendingPins(snapshot?.rows ?? [])) : []  // no stale list when the daemon is off
-        let rows = filtered(all)
+        var rows = filtered(all)
+        // Search shows every match; otherwise stale rows go after one fold line.
+        let stale = searchMode ? [] : rows.filter { isStale($0.0) }
+        if !stale.isEmpty { rows = rows.filter { !isStale($0.0) } + (foldOpen ? stale : []) }
+        let foldAt = rows.count - (foldOpen ? stale.count : 0)  // index of the fold line
         let open = !all.isEmpty || searchMode
         let barH: CGFloat = searchMode ? fs(30) : 0
         let width = open ? max(pillW, listWidth) : pillW
         let screen = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: anchor.x - 1, y: anchor.y - 1)) })
-        let docH = rows.isEmpty ? 0 : CGFloat(rows.count) * rowHeight + 6
+        let lines = rows.count + (stale.isEmpty ? 0 : 1)
+        let docH = lines == 0 ? 0 : CGFloat(lines) * rowHeight + 6
         // A long list stops at the screen's visible height; the rest scrolls.
         let maxListH = max(rowHeight * 3, (screen?.visibleFrame.height ?? 800) - pillHeight - barH - 16)
-        let listH = rows.isEmpty ? (searchMode ? 4 : 0) : min(docH, maxListH)
+        let listH = lines == 0 ? (searchMode ? 4 : 0) : min(docH, maxListH)
         let height = pillHeight + barH + listH
         var frame = NSRect(x: anchor.x - width, y: anchor.y - height, width: width, height: height)
         if let screen = screen {
@@ -1011,11 +1157,23 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             chatToggle.frame = NSRect(x: width - pad - fs(130), y: barY + 1, width: fs(56), height: fs(20))
             searchField.frame = NSRect(x: pad, y: barY, width: width - pad * 3 - fs(130), height: fs(24))
         }
-        scroll.isHidden = rows.isEmpty
+        scroll.isHidden = lines == 0
         scroll.frame = NSRect(x: 0, y: 0, width: width, height: listH)
         listView.frame = NSRect(x: 0, y: 0, width: width, height: max(docH, listH))
         var y: CGFloat = 2
-        for (r, note) in rows {
+        func addFold() {
+            let f = FoldView(count: stale.count, open: foldOpen, frame: NSRect(x: 0, y: y, width: width, height: rowHeight)) {
+                [weak self] in
+                guard let self = self else { return }
+                self.foldOpen.toggle()
+                self.layout()
+            }
+            listView.addSubview(f)
+            foldView = f
+            y += rowHeight
+        }
+        for (i, (r, note)) in rows.enumerated() {
+            if !stale.isEmpty && i == foldAt { addFold() }
             let v = RowView(row: r, frame: NSRect(x: 0, y: y, width: width, height: rowHeight), note: note) {
                 [weak self] row in self?.raise(row)
             }
@@ -1024,6 +1182,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             rowViews.append(v)
             y += rowHeight
         }
+        if !stale.isEmpty && foldAt == rows.count { addFold() }
         pill.needsDisplay = true
         root.needsDisplay = true
     }
@@ -1051,6 +1210,25 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     func raise(_ row: Row) {
         sendRequest("raise", row.session)
         collapse()
+    }
+
+    /// The hotkey: open the list in search mode, also on another Space; again: close it.
+    func hotkeyPressed() {
+        if searchMode { collapse(); return }
+        if !panel.isVisible || !panel.isOnActiveSpace {
+            panel.collectionBehavior = [.ignoresCycle, .moveToActiveSpace]
+            panel.orderFrontRegardless()
+            panel.collectionBehavior = [.ignoresCycle]
+        }
+        stopIntent()
+        hoverBlocked = false
+        startSearch()
+    }
+
+    /// Done or idle for more than fold_idle_h hours, not pinned, not new: folded at the end.
+    func isStale(_ r: Row) -> Bool {
+        foldIdleH > 0 && r.pinned != true && r.unseen != true && ["done", "idle", "ended"].contains(r.state)
+            && Date().timeIntervalSince1970 - (r.last ?? r.since) > foldIdleH * 3600
     }
 
     /// Pin or unpin; the daemon keeps the pins. The list sorts again, pinned rows first.

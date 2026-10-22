@@ -2,7 +2,9 @@
   "panel": {
     "font_size": 12,
     "list_width": 440,
-    "hover_ms": 120
+    "hover_ms": 120,
+    "hotkey": "ctrl+opt+space",
+    "fold_idle_h": 12
   },
   "daemon": {
     "n_active": 5,
