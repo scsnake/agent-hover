@@ -165,7 +165,7 @@ def _update_cache(path):
         index = {}
     offset, text_size, meta = index.get("offset", 0), index.get("text_size", 0), index.get("meta", {})
     if (index.get("v") != CACHE_VERSION or index.get("path") != str(path) or index.get("inode") != st.st_ino
-            or st.st_size < offset):
+            or st.st_size < offset or not text_file.exists()):
         offset, text_size, meta = 0, 0, {}  # new, replaced or cut transcript, or old cache: build again
     if offset == st.st_size and text_file.exists() and text_file.stat().st_size == text_size:
         return text_file, index

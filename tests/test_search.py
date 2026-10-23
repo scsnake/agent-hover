@@ -188,3 +188,12 @@ def test_closed_sessions(tmp_path, monkeypatch):
     assert by_id[sid]["resume"] == f"cd /w/tool && codex resume {sid}"
     assert search.search_closed("app", days=7, tabs=tabs)[0]["where"] == ["folder"]
     assert search.search_closed("invoice", days=0, tabs=tabs) == []
+
+
+def test_cache_rebuilds_when_the_text_file_is_gone(tmp_path):
+    f = tmp_path / "S.jsonl"
+    write_jsonl(f, [msg("one invoice")])
+    search.search_chat(f, "invoice")
+    text_file, _ = search._cache_files(f)
+    text_file.unlink()
+    assert search.search_chat(f, "invoice") == (1, "one invoice")

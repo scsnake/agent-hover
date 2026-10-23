@@ -246,7 +246,7 @@ final class Panel: NSPanel {
 final class PillView: NSView {
     var content = NSAttributedString()
     var onDragBegin: (() -> Void)?
-    var onDragMove: (() -> Void)?
+    var onDragMove: ((NSPoint) -> NSPoint)?
     var onDragEnd: (() -> Void)?
     var onClick: (() -> Void)?
 
@@ -267,8 +267,10 @@ final class PillView: NSView {
 /// Own drag loop (not performDrag), so a click and a drag can be told apart. The 1 s refresh
 /// timer does not run in this loop, so it cannot move the panel back during the drag. The loop
 /// also wakes every 50 ms with no mouse event, so onMove can time how long the panel rests.
+/// onMove gets the raw position (where the cursor drags the panel) and returns where to put it
+/// (the magnet), so the panel moves once per tick, with no jitter.
 /// onBegin may resize the window (the edge bar turns into the pill): the move goes on from there.
-func dragLoop(_ win: NSWindow, onBegin: (() -> Void)?, onMove: (() -> Void)?, onEnd: (() -> Void)?,
+func dragLoop(_ win: NSWindow, onBegin: (() -> Void)?, onMove: ((NSPoint) -> NSPoint)?, onEnd: (() -> Void)?,
               onClick: (() -> Void)?) {
     var start = NSEvent.mouseLocation
     var origin = win.frame.origin
@@ -286,8 +288,9 @@ func dragLoop(_ win: NSWindow, onBegin: (() -> Void)?, onMove: (() -> Void)?, on
             }
         }
         if moved {
-            win.setFrameOrigin(NSPoint(x: origin.x + p.x - start.x, y: origin.y + p.y - start.y))
-            onMove?()
+            let raw = NSPoint(x: origin.x + p.x - start.x, y: origin.y + p.y - start.y)
+            let to = onMove?(raw) ?? raw
+            if to != win.frame.origin { win.setFrameOrigin(to) }
         }
         if e?.type == .leftMouseUp { break }
     }
@@ -297,7 +300,7 @@ func dragLoop(_ win: NSWindow, onBegin: (() -> Void)?, onMove: (() -> Void)?, on
 /// The edge bar. A drag pulls the panel out (as the pill); see Controller.dragMoved for the rule.
 final class BarView: NSView {
     var onDragBegin: (() -> Void)?
-    var onDragMove: (() -> Void)?
+    var onDragMove: ((NSPoint) -> NSPoint)?
     var onDragEnd: (() -> Void)?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -644,6 +647,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     var foldOpen = false  // the stale rows are shown (until the list closes)
     var foldView: FoldView?
     var foldHoverSince: Date?
+    var foldHoverBlocked = false  // a click closed the fold: no hover-open until the cursor leaves it
     var hoverBlocked = false  // just docked under the cursor: do not open until the cursor leaves the bar
     var order: [String: Int] = [:]  // row position by session, kept while the list is open
     var pillRow: Row?  // the tab the pill shows; a click on the pill raises it
@@ -696,10 +700,10 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         root.layer?.masksToBounds = true
         root.onHover = { [weak self] inside in self?.hover(inside) }
         pill.onDragBegin = { [weak self] in self?.dragBegan() }
-        pill.onDragMove = { [weak self] in self?.dragMoved() }
+        pill.onDragMove = { [weak self] raw in self?.dragMoved(raw) ?? raw }
         pill.onDragEnd = { [weak self] in self?.dragEnded() }
         barView.onDragBegin = { [weak self] in self?.barDragBegan() }
-        barView.onDragMove = { [weak self] in self?.dragMoved() }
+        barView.onDragMove = { [weak self] raw in self?.dragMoved(raw) ?? raw }
         barView.onDragEnd = { [weak self] in self?.dragEnded() }
         pill.onClick = { [weak self] in
             if let self = self, let r = self.pillRow { self.raise(r) }
@@ -752,16 +756,32 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         return NSPoint(x: f.maxX, y: f.maxY)  // the top-right corner, flush
     }
 
+    /// The screen a drag is on: the one under the cursor (panel.screen lags when crossing screens).
+    func dragScreen() -> NSScreen? {
+        NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? panel.screen ?? NSScreen.main
+    }
+
+    /// Outer edges of a screen next to the frame: no other screen lies just beyond them, so the
+    /// magnet and the dock zone apply there. An edge shared with another monitor is open.
+    func outerEdges(_ screen: NSScreen, near f: NSRect) -> (left: Bool, right: Bool, bottom: Bool, top: Bool) {
+        let s = screen.frame
+        func free(_ p: NSPoint) -> Bool { !NSScreen.screens.contains { $0 !== screen && $0.frame.contains(p) } }
+        let midY = min(max(f.midY, s.minY + 1), s.maxY - 1), midX = min(max(f.midX, s.minX + 1), s.maxX - 1)
+        return (free(NSPoint(x: s.minX - 1, y: midY)), free(NSPoint(x: s.maxX + 1, y: midY)),
+                free(NSPoint(x: midX, y: s.minY - 1)), free(NSPoint(x: midX, y: s.maxY + 1)))
+    }
+
     /// Dock zone: the drag pushes the panel's right side at least dock_px past the screen's right
-    /// edge (the raw position, before the magnet). A panel that only sits flush at the edge is not in it.
-    func inDockZone() -> Bool {
-        guard let vis = (panel.screen ?? NSScreen.main)?.visibleFrame else { return false }
-        return panel.frame.maxX >= vis.maxX + dockPx
+    /// edge (the raw position, before the magnet), and that edge is an outer one. A panel that only
+    /// sits flush at the edge is not in it.
+    func inDockZone(_ f: NSRect) -> Bool {
+        guard let screen = dragScreen() else { return false }
+        return outerEdges(screen, near: f).right && f.maxX >= screen.visibleFrame.maxX + dockPx
     }
 
     /// A drag of the pill starts. A docked panel starts armed: it stays docked unless pulled out.
     func dragBegan() {
-        dockArmed = docked && inDockZone()
+        dockArmed = docked && inDockZone(panel.frame)
         zoneSince = dockArmed ? Date() : nil
         showArmed()
     }
@@ -781,8 +801,9 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     /// for dock_delay_ms before a release docks it; out of the zone, it is not armed at once.
     /// So docking needs a push past the edge and a short hold; a small pull back undocks (panel
     /// preferred).
-    func dragMoved() {
-        if inDockZone() {
+    func dragMoved(_ raw: NSPoint) -> NSPoint {
+        let f = NSRect(origin: raw, size: panel.frame.size)
+        if inDockZone(f) {
             let now = Date()
             if zoneSince == nil { zoneSince = now }
             if now.timeIntervalSince(zoneSince!) >= dockDelayMs / 1000 { dockArmed = true }
@@ -790,21 +811,23 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             zoneSince = nil
             dockArmed = false
         }
-        if magnetPx > 0 && !NSEvent.modifierFlags.contains(.option) { snapToEdges() }
         showArmed()
+        return magnetPx > 0 && !NSEvent.modifierFlags.contains(.option) ? snapped(f).origin : raw
     }
 
-    /// Magnet: an edge of the panel within magnet_px of a screen edge (or past it) snaps flush to
-    /// it. The drag loop sets the raw position before each call, so the snap never adds up, and
-    /// inDockZone reads that raw position first: a push past the edge still docks.
-    func snapToEdges() {
-        guard let vis = (panel.screen ?? NSScreen.main)?.visibleFrame else { return }
-        var f = panel.frame
-        if vis.maxX - f.maxX < magnetPx { f.origin.x = vis.maxX - f.width }
-        else if f.minX - vis.minX < magnetPx { f.origin.x = vis.minX }
-        if f.minY - vis.minY < magnetPx { f.origin.y = vis.minY }
-        if vis.maxY - f.maxY < magnetPx { f.origin.y = vis.maxY - f.height }  // top wins
-        if f.origin != panel.frame.origin { panel.setFrameOrigin(f.origin) }
+    /// Magnet: an edge of the panel within magnet_px of an outer screen edge (or past it) snaps
+    /// flush to it. It works on the raw position, so the snap never adds up, and inDockZone reads
+    /// the raw position too: a push past the edge still docks. At an edge shared with another
+    /// monitor there is no snap, so the panel can move across.
+    func snapped(_ raw: NSRect) -> NSRect {
+        guard let screen = dragScreen() else { return raw }
+        let vis = screen.visibleFrame, outer = outerEdges(screen, near: raw)
+        var f = raw
+        if outer.right && vis.maxX - f.maxX < magnetPx { f.origin.x = vis.maxX - f.width }
+        else if outer.left && f.minX - vis.minX < magnetPx { f.origin.x = vis.minX }
+        if outer.bottom && f.minY - vis.minY < magnetPx { f.origin.y = vis.minY }
+        if outer.top && vis.maxY - f.maxY < magnetPx { f.origin.y = vis.maxY - f.height }  // top wins
+        return f
     }
 
     /// The accent border: a release now docks the panel.
@@ -935,7 +958,9 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         // The same hit test as updatePreview: the cursor in list coordinates, inside the scroll view.
         let inWindow = panel.convertPoint(fromScreen: NSEvent.mouseLocation)
         let onList = scroll.bounds.contains(scroll.convert(inWindow, from: nil))
-        guard let f = foldView, !foldOpen, onList, f.frame.contains(listView.convert(inWindow, from: nil)) else {
+        let onFold = onList && foldView.map { $0.frame.contains(listView.convert(inWindow, from: nil)) } ?? false
+        if !onFold { foldHoverBlocked = false }
+        guard foldView != nil, !foldOpen, onFold, !foldHoverBlocked else {
             foldHoverSince = nil
             return
         }
@@ -1414,6 +1439,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
                 [weak self] in
                 guard let self = self else { return }
                 self.foldOpen.toggle()
+                self.foldHoverBlocked = !self.foldOpen  // closed by a click under the cursor
                 self.layout()
             }
             listView.addSubview(f)

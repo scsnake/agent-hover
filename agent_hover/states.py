@@ -103,6 +103,46 @@ def question_text(payload, limit=1500):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _file_part(path, size, tail):
+    try:
+        with open(path, "rb") as f:
+            if tail:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - size))
+            return f.read(size).decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def codex_rollout(session_id):
+    """Codex's session file for a session ID (~/.codex/sessions/YYYY/MM/DD/rollout-...-<id>.jsonl)."""
+    if not isinstance(session_id, str) or not UUID_RE.fullmatch(session_id):
+        return None
+    found = sorted((Path.home() / ".codex" / "sessions").glob(f"*/*/*/rollout-*{session_id}.jsonl"))
+    return found[-1] if found else None
+
+
+SDK_CLI_RE = re.compile(r'"entrypoint":\s*"sdk-cli"')  # Claude transcript line of a `claude -p` run
+CODEX_EXEC_RE = re.compile(r'"source":\s*"exec"|"originator":\s*"codex_exec"')  # Codex session_meta
+
+
+def nested_run(agent, payload, env=None):
+    """True for an agent run as a command, not by the person: `claude -p` or `codex exec`, often
+    started by the agent in the same tab (it inherits the tab's ITERM_SESSION_ID). Its events
+    must not change that tab's state (a `claude -p` SessionEnd hid a running Codex tab)."""
+    env = os.environ if env is None else env
+    transcript = payload.get("transcript_path")
+    if agent == "claude":
+        if env.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-cli":
+            return True
+        # Claude writes "entrypoint" on each line; one huge last line can hide it from the tail.
+        return any(SDK_CLI_RE.search(_file_part(transcript, 8192, tail=t)) for t in (True, False))
+    if agent == "codex":
+        head = _file_part(transcript or codex_rollout(payload.get("session_id")), 8192, tail=False)
+        return bool(CODEX_EXEC_RE.search(head))
+    return False
+
+
 def load_config():
     """~/.agent-hover/config.json as a dict ({} if missing or broken). See config.example.json."""
     try:
@@ -143,7 +183,7 @@ def _continued_in(transcript, tail_bytes=16384):
             try:
                 return json.loads(line).get("continuedInSessionId")
             except (ValueError, AttributeError):
-                return None
+                continue  # a cut first line, or the words inside a message: look further up
     return None
 
 

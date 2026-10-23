@@ -47,6 +47,7 @@ def clean_name(name):
 
 AGENTS = ["claude", "codex"]  # plus config.json "agents": {"extra": [...]}
 SEED_SCAN_S = 5.0
+ENDED_GRACE_S = 10.0  # an agent that wrote SessionEnd may still be the tab's job for a moment
 # Claude Code keeps one file per running process: {"pid", "sessionId", "cwd", "status", ...}.
 CLAUDE_SESSIONS = Path.home() / ".claude" / "sessions"
 CLAUDE_STATUS = {"busy": states.WORKING, "idle": states.IDLE, "waiting": states.WAITING}
@@ -119,10 +120,39 @@ async def seed_agents(app, known, checked):
             for s in t.all_sessions:
                 sid = s.session_id
                 rec = known.get(sid)
-                if rec is not None and rec.get("event") != "seed":
-                    continue  # the hooks report this tab
                 pid = await s.async_get_variable("jobPid")
+                reseed = False
+                if rec is not None and rec.get("event") != "seed":
+                    # The hooks report this tab. Safety net: a record from another agent, or
+                    # "ended", while an agent is the tab's foreground job (for example a nested
+                    # `claude -p` ended inside a Codex tab) must not hide that agent: seed it again.
+                    # Read the tab again when its job or the record's agent or state changes.
+                    key = (pid, rec.get("agent"), rec.get("state"))
+                    if checked.get(sid) == key:
+                        continue
+                    checked[sid] = key
+                    agent = detect_agent(await s.async_get_variable("processTitle"),
+                                         await s.async_get_variable("commandLine"))
+                    ended_long = rec.get("state") == states.ENDED and now - rec.get("ts", now) > ENDED_GRACE_S
+                    if not agent or (agent == rec.get("agent") and not ended_long):
+                        if rec.get("state") == states.ENDED and not ended_long:
+                            checked.pop(sid, None)  # look again after the grace time
+                        continue
+                    log("reseed", session=sid, agent=agent, was_agent=rec.get("agent"), was_state=rec.get("state"))
+                    rec, reseed = None, True
+                    checked.pop(sid, None)
                 if rec is not None:
+                    if checked.get(sid) not in (None, pid):  # the job changed: did the agent quit?
+                        if not detect_agent(await s.async_get_variable("processTitle"),
+                                            await s.async_get_variable("commandLine")):
+                            latest = states.read_state(sid) or {}
+                            if latest.get("event") == "seed":
+                                states.write_state(sid, {**latest, "state": states.ENDED, "ts": now,
+                                                         "event": "seed_end", "detail": ""})
+                                log("seed_end", session=sid)
+                            checked[sid] = pid
+                            continue
+                    checked[sid] = pid
                     if rec.get("agent") == "claude":
                         new = with_claude_session(rec, claude_session(pid), now)
                         latest = states.read_state(sid) or {}
@@ -136,7 +166,9 @@ async def seed_agents(app, known, checked):
                 checked[sid] = pid
                 agent = detect_agent(await s.async_get_variable("processTitle"),
                                      await s.async_get_variable("commandLine"))
-                if agent and not states.state_path(sid).exists():  # a hook may have just written it
+                latest = states.read_state(sid) if reseed else None  # a hook may have just written it
+                if agent and (not states.state_path(sid).exists()
+                              or (reseed and (latest or {}).get("ts") == (known.get(sid) or {}).get("ts"))):
                     rec = seed_record(sid, agent, await s.async_get_variable("autoName"),
                                       await s.async_get_variable("path"), now)
                     if agent == "claude":
@@ -163,12 +195,27 @@ def process_table():
     return table
 
 
-def tree_usage(table, root):
-    """(% CPU, memory in MB) of a process and all its children: the agent, its MCP servers and
-    the commands it runs. macOS %CPU is a decaying recent average."""
+def as_pid(value):
+    """iTerm2's jobPid as a positive int, or None."""
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def child_map(table):
+    """parent pid -> child pids, built once per scan."""
     children = {}
     for pid, (ppid, _, _) in table.items():
         children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def tree_usage(table, root, children=None):
+    """(% CPU, memory in MB) of a process and all its children: the agent, its MCP servers and
+    the commands it runs. macOS %CPU is a decaying recent average."""
+    children = child_map(table) if children is None else children
     cpu = kb = 0.0
     todo, seen = [root], set()
     while todo:
@@ -494,7 +541,7 @@ async def open_resume_tab(app, req):
         session = (await window.async_create_tab()).current_session
     else:
         window = await iterm2.Window.async_create(app.connection)
-        session = window.current_session
+        session = window.current_tab.current_session
     await asyncio.sleep(0.5)  # let the new shell start, so it reads the typed text at its prompt
     await session.async_send_text(f"cd {shlex.quote(cwd)}\n")
     await session.async_send_text(search.resume_command(agent, sid, ""))
@@ -627,8 +674,9 @@ async def run(conn, args):
             names_ts = now
             parts["names"] = time.monotonic() - t
         if update_on and now - update_ts > UPDATE_EVERY_S:
-            update_ts = now  # also after a failed check: try again tomorrow
             found = await asyncio.to_thread(check_update)
+            # A failed check (no network after wake, for example) is tried again in an hour.
+            update_ts = now if found else now - UPDATE_EVERY_S + 3600
             if found:
                 update = found
                 tmp = UPDATE_FILE.with_suffix(".tmp")
@@ -638,11 +686,12 @@ async def run(conn, args):
         if now - usage_ts > USAGE_SCAN_S:
             t = time.monotonic()
             table = await asyncio.to_thread(process_table)
+            children = child_map(table)
             for sid in listed:
                 session = app.get_session_by_id(sid)
-                pid = await session.async_get_variable("jobPid") if session is not None else None
-                if isinstance(pid, int) and pid > 0:
-                    usage[sid] = tree_usage(table, pid)
+                pid = as_pid(await session.async_get_variable("jobPid")) if session is not None else None
+                if pid:
+                    usage[sid] = tree_usage(table, pid, children)
                     hot[sid] = hot_update(hot_since, sid, recs[sid]["state"], usage[sid][0], now,
                                           args.cpu_hot_pct, args.cpu_hot_min)
             usage_ts = now

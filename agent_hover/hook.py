@@ -51,13 +51,15 @@ def main():
     if not uuid:
         return
     mapped = states.map_event(agent, payload)
+    nested = states.nested_run(agent, payload)
     now = time.time()
     states.append_log("events.jsonl", {"ts": now, "agent": agent, "iterm": uuid,
                                        "event": payload.get("hook_event_name"),
                                        "tool": payload.get("tool_name"),
                                        "type": payload.get("notification_type"),
-                                       "state": mapped[0] if mapped else None})
-    if not mapped:
+                                       "state": mapped[0] if mapped else None,
+                                       **({"nested": True} if nested else {})})
+    if not mapped or nested:
         return
     state, detail = mapped
     prev = states.read_state(uuid) or {}
