@@ -80,25 +80,45 @@ MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]{1,80})"')
 PROVIDER_RE = re.compile(r'"model_provider"\s*:\s*"([^"]{1,80})"')
 
 
-def transcript_model(path, tail=256 * 1024, head=32 * 1024):
+_model_cache = {}  # path -> (bytes read, last model, provider)
+
+
+def transcript_model(path, chunk=256 * 1024, head=32 * 1024):
     """The model a transcript used last, e.g. 'claude-opus-5-5' or 'gpt-5.6-sol (openai)'.
 
     Claude writes "model" in each answer; Codex writes "model" in each turn and
-    "model_provider" in its first line. A custom provider shows up the same way. None if not found."""
+    "model_provider" in its first line. A custom provider shows up the same way. None if not found.
+    A long Codex turn can leave megabytes without a "model" line, so the first read goes back
+    chunk by chunk until it finds one; later reads only look at the new end of the file."""
+    path = str(path)
     try:
         with open(path, "rb") as f:
-            start = f.read(head).decode("utf-8", "replace")
             f.seek(0, 2)
             size = f.tell()
-            f.seek(max(0, size - tail))
-            end = f.read().decode("utf-8", "replace")
+            done, model, provider = _model_cache.get(path, (0, None, None))
+            if size < done:  # file replaced: start again
+                done, model, provider = 0, None, None
+            if provider is None and size:
+                f.seek(0)
+                found = PROVIDER_RE.findall(f.read(head).decode("utf-8", "replace"))
+                provider = found[-1] if found else ""
+            # Read back from the end in chunks, down to what an earlier call already read.
+            # The overlap keeps a match that a chunk edge cuts in two.
+            end = size
+            while end > done:
+                begin = max(done, end - chunk)
+                f.seek(max(0, begin - 128))
+                found = MODEL_RE.findall(f.read(end - begin + min(begin, 128)).decode("utf-8", "replace"))
+                if found:
+                    model = found[-1]
+                    break
+                end = begin
     except OSError:
         return None
-    models = MODEL_RE.findall(end) or MODEL_RE.findall(start)
-    if not models:
+    _model_cache[path] = (size, model, provider)
+    if not model:
         return None
-    provider = PROVIDER_RE.findall(start)
-    return models[-1] + (f" ({provider[-1]})" if provider else "")
+    return model + (f" ({provider})" if provider else "")
 
 
 def message_texts(record):

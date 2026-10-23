@@ -114,7 +114,7 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
              "hotkey": "ctrl+opt+space", "fold_idle_h": 12, "fold_waiting_h": 24, "closed_days": 7,
              "dock_px": 4, "dock_delay_ms": 500, "magnet_px": 24},
   "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120,
-             "cpu_hot_pct": 50, "cpu_hot_min": 2},
+             "cpu_hot_pct": 50, "cpu_hot_min": 2, "notify_limit_reset": true},
   "agents": {"extra": []},
   "update_check": false
 }
@@ -130,6 +130,7 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 - `panel.dock_px`, `panel.dock_delay_ms`: how sticky the screen edge is. A dragged panel docks only when you push it at least `dock_px` past the right edge and hold for `dock_delay_ms` (the blue border then shows). A small pull back undocks it.
 - `panel.magnet_px`: a dragged panel within this distance of a screen edge snaps flush to it (also right after you pull it out of the bar). Hold ⌥ (Option) while you drag for no snap. `0` turns it off.
 - `daemon.cpu_hot_pct`, `daemon.cpu_hot_min`: the red flame shows when an agent that is not working uses at least this % CPU for this many minutes. `cpu_hot_pct: 0` turns it off.
+- `daemon.notify_limit_reset`: when a Codex tab waits on a usage limit, hover its agent mark to see when the limit resets. At the reset time, a macOS notification says the agent can continue (Codex does not go on by itself), and the agent mark blinks the first time you open the list after it (for 30 s, or until you click the panel). `false` turns the notification off. The first notification may ask you to allow notifications for Script Editor.
 - `update_check`: `true` checks once a day for a newer version. The pill then shows **↑ update**, and `./run.sh doctor` says so. Run `./run.sh update` to get it. Off by default.
 - Logs in `~/.agent-hover/log/` move to `<name>.1` at 5 MB; one old file is kept.
 - `agents.extra`: more job names to find (for example `qwen`). Such an agent also needs hooks that call `agent_hover/hook.py <name>` with Claude-style events.
@@ -178,6 +179,7 @@ Everything stays on your Mac. There are no network calls, except the update chec
 - The chat search and the model name in the hover frame read the agents' own transcript files (`~/.claude/projects`, `~/.codex/sessions`), only when you search or for the open tabs.
 - The chat search keeps a copy of the message text (no tool output) in `~/.agent-hover/chatcache/`, so a search takes well under 0.1 s. Entries of deleted transcripts are removed at the next chat search. You can delete the folder at any time; the next search builds it again.
 - For an agent tab with no hook event yet, the daemon reads Claude Code's own process file (`~/.claude/sessions/<pid>.json`) for its session ID, folder and state. It also reads the process list (`ps`) for CPU and memory.
+- Claude Code reports its own usage limits through hooks: a turn stopped by a usage limit or an account problem (`StopFailure`), or a limit that reset while the Mac slept (`quota_auto_resume_stale`), shows as **waiting** with Claude's message.
 - For a working Codex tab, the daemon reads the end of its session file (`~/.codex/sessions`) every 5 s. Codex sends no hook when a turn ends with an error, so this is how a usage-limit stop shows as **waiting** (Codex then asks whether to switch to a smaller model). A Codex tab with no hook event yet is matched to its session file through the files its process has open (`lsof`).
 - Peek reads the hovered tab's screen through iTerm2, and keeps the last lines in `~/.agent-hover/peek.json`.
 

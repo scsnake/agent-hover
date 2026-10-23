@@ -114,7 +114,7 @@
              "hotkey": "ctrl+opt+space", "fold_idle_h": 12, "fold_waiting_h": 24, "closed_days": 7,
              "dock_px": 4, "dock_delay_ms": 500, "magnet_px": 24},
   "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120,
-             "cpu_hot_pct": 50, "cpu_hot_min": 2},
+             "cpu_hot_pct": 50, "cpu_hot_min": 2, "notify_limit_reset": true},
   "agents": {"extra": []},
   "update_check": false
 }
@@ -130,6 +130,7 @@
 - `panel.dock_px`、`panel.dock_delay_ms`：螢幕邊緣有多「黏」。拖曳中的面板要推過右邊緣至少 `dock_px`，並停留 `dock_delay_ms`（此時出現藍框），放開才會變成邊緣細條。稍微拉回就會變回面板。
 - `panel.magnet_px`：拖曳中的面板離螢幕邊緣在這個距離以內時，會貼齊邊緣（從邊緣細條拉出來後也一樣）。拖曳時按住 ⌥（Option）就不吸附。`0` 表示關閉。
 - `daemon.cpu_hot_pct`、`daemon.cpu_hot_min`：代理沒在工作，但 CPU 用量至少這個百分比、持續這麼多分鐘時，顯示紅色火焰。`cpu_hot_pct: 0` 表示關閉。
+- `daemon.notify_limit_reset`：Codex 分頁因用量上限而等待時，把滑鼠停在它的代理標記上，即可看到重置時間。到了重置時間，macOS 會跳出通知，告訴你代理可以繼續（Codex 不會自己繼續）；之後你第一次展開清單時，該代理標記會閃爍 30 秒，或直到你在面板上點一下。`false` 表示不通知。第一次通知時，系統可能會要求你允許 Script Editor 的通知。
 - `update_check`：設為 `true` 時每天檢查一次新版本。有新版時膠囊會顯示 **↑ update**，`./run.sh doctor` 也會提示。執行 `./run.sh update` 即可更新。預設關閉。
 - `~/.agent-hover/log/` 裡的紀錄檔超過 5 MB 會改名為 `<名稱>.1`，只保留一個舊檔。
 - `agents.extra`：要額外辨識的程式名稱（例如 `qwen`）。這類代理也需要設定 hook，以 Claude 格式的事件呼叫 `agent_hover/hook.py <名稱>`。
@@ -178,6 +179,7 @@
 - 對話搜尋與小框中的模型名稱會讀取代理自己的對話紀錄檔（`~/.claude/projects`、`~/.codex/sessions`），只在你搜尋時，或針對目前開著的分頁讀取。
 - 對話搜尋會在 `~/.agent-hover/chatcache/` 保存一份訊息文字的副本（不含工具輸出），所以一次搜尋遠少於 0.1 秒。對話紀錄檔被刪除後，下次對話搜尋時會一併移除它的副本。這個資料夾可以隨時刪除，下次搜尋會重新建立。
 - 對還沒有 hook 事件的代理分頁，背景程式會讀取 Claude Code 自己的程序檔（`~/.claude/sessions/<pid>.json`），取得對話 ID、資料夾與狀態。它也會讀取程序清單（`ps`）來計算 CPU 與記憶體。
+- Claude Code 會透過 hook 回報自己的用量上限：一輪因用量上限或帳號問題停止（`StopFailure`），或上限在 Mac 睡眠時重置（`quota_auto_resume_stale`），都會顯示為**等待中**，並附上 Claude 的訊息。
 - 對工作中的 Codex 分頁，背景程式每 5 秒讀取其對話紀錄檔（`~/.codex/sessions`）的結尾。Codex 在一輪因錯誤結束時不會送出 hook，所以要靠這個方法，把用量上限的停止顯示為**等待中**（Codex 接著會詢問是否改用較小的模型）。還沒有 hook 事件的 Codex 分頁，會透過其程序開啟的檔案（`lsof`）對應到它的對話紀錄檔。
 - 偷看功能透過 iTerm2 讀取滑鼠所指分頁的畫面，並把最後幾行存在 `~/.agent-hover/peek.json`。
 

@@ -108,6 +108,7 @@ struct Row: Decodable {
     let cpu: Double?       // % CPU of the agent's process tree (agent, MCP servers, its commands)
     let mem_mb: Double?    // memory of that tree, MB
     let hot: Bool?         // not working, but high CPU for minutes (daemon cpu_hot_pct / cpu_hot_min)
+    let resets_at: Double? // waiting on a Codex usage limit: when it resets (Unix time)
 }
 
 struct Snapshot: Decodable {
@@ -237,8 +238,13 @@ func onFirstSpace(of screen: NSScreen?) -> Bool? {
 
 final class Panel: NSPanel {
     var allowKey = false  // true only in search mode, so the search field can take the keyboard
+    var onMouseDown: (() -> Void)?  // any click on the panel (it ends the limit-over blink)
     override var canBecomeKey: Bool { allowKey }
     override var canBecomeMain: Bool { false }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown || event.type == .rightMouseDown { onMouseDown?() }
+        super.sendEvent(event)
+    }
 }
 
 /// The collapsed pill: the most recent tab and the counts. A drag moves the panel;
@@ -405,6 +411,7 @@ func rowInfo(_ row: Row) -> String {
     if let c = row.cpu { lines.append("CPU: \(Int(c.rounded()))% (with its MCP servers and commands)") }
     if let mb = row.mem_mb { lines.append("Memory: \(Int(mb)) MB") }
     if row.hot == true { lines.append("High CPU while not working: stuck, or a command still running") }
+    if row.state == "waiting", let r = row.resets_at { lines.append(limitText(r)) }
     return lines.joined(separator: "\n")
 }
 
@@ -413,6 +420,16 @@ func markHitRange(_ row: Row, width: CGFloat) -> ClosedRange<CGFloat> {
     let markX = width - pad - ageColumnW - 6 - markColumnW / 2
     let flameW = row.hot == true ? (flameIcon()?.size.width ?? 0) + 4 : 0
     return (markX - markColumnW / 2 - flameW)...(markX + markColumnW / 2)
+}
+
+/// "Usage limit: resets 19:42" before the reset, "... over since 19:42" after it. A reset more
+/// than 20 h away (the weekly limit) also shows the day.
+func limitText(_ resetsAt: Double) -> String {
+    let date = Date(timeIntervalSince1970: resetsAt)
+    let f = DateFormatter()
+    f.dateFormat = abs(date.timeIntervalSinceNow) > 20 * 3600 ? "EEE HH:mm" : "HH:mm"
+    let when = f.string(from: date)
+    return date > Date() ? "Usage limit: resets \(when)" : "Usage limit over since \(when): the agent can continue"
 }
 
 /// The high-CPU mark (SF Symbol, tinted).
@@ -428,6 +445,7 @@ final class RowView: NSView {
     let note: String?  // search mode: what matched (folder or chat line), after the name
     let onClick: (Row) -> Void
     var onPin: ((Row, Bool) -> Void)?
+    var blinkOff = false  // the limit-over blink, off phase: the agent mark is not drawn
     private var hover = false
 
     init(row: Row, frame: NSRect, note: String? = nil, onClick: @escaping (Row) -> Void) {
@@ -481,7 +499,7 @@ final class RowView: NSView {
         let ageText = text(age(row.last ?? row.since), infoColor, size: 11)
         ageText.draw(at: NSPoint(x: bounds.width - pad - ageText.size().width, y: y + 1))
         let markX = bounds.width - pad - ageColumnW - 6 - markColumnW / 2
-        drawCentered(agentBadge(row.agent), centerX: markX, y: y + 1)
+        if !blinkOff { drawCentered(agentBadge(row.agent), centerX: markX, y: y + 1) }
         var rightW = ageColumnW + 6 + markColumnW
         if row.hot == true, let flame = flameIcon() {  // left of the agent mark
             let x = markX - markColumnW / 2 - flame.size.width - 2
@@ -490,7 +508,9 @@ final class RowView: NSView {
             rightW += flame.size.width + 4
         }
         var label = row.name
-        if let d = row.detail, !d.isEmpty, row.state == "waiting" { label += "  — \(d)" }
+        if let d = row.detail, !d.isEmpty, row.state == "waiting", row.resets_at == nil {
+            label += "  — \(d)"  // a usage limit shows on the agent mark's frame instead (rowInfo)
+        }
         let nameRect = NSRect(x: pad + fs(32), y: y, width: bounds.width - rightW - pad * 2 - fs(40), height: fs(16))
         let style = NSMutableParagraphStyle()
         style.lineBreakMode = .byTruncatingTail
@@ -648,6 +668,11 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     var foldView: FoldView?
     var foldHoverSince: Date?
     var foldHoverBlocked = false  // a click closed the fold: no hover-open until the cursor leaves it
+    var blinking = Set<String>()  // sessions whose agent mark blinks: their usage limit is over
+    var blinkDone = Set<String>()  // blinked once already (only the first open after the reset)
+    var blinkUntil = Date.distantPast
+    var blinkTimer: Timer?
+    var blinkPhase = true
     var hoverBlocked = false  // just docked under the cursor: do not open until the cursor leaves the bar
     var order: [String: Int] = [:]  // row position by session, kept while the list is open
     var pillRow: Row?  // the tab the pill shows; a click on the pill raises it
@@ -699,6 +724,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         root.layer?.cornerRadius = 9
         root.layer?.masksToBounds = true
         root.onHover = { [weak self] inside in self?.hover(inside) }
+        panel.onMouseDown = { [weak self] in self?.stopBlinks() }
         pill.onDragBegin = { [weak self] in self?.dragBegan() }
         pill.onDragMove = { [weak self] raw in self?.dragMoved(raw) ?? raw }
         pill.onDragEnd = { [weak self] in self?.dragEnded() }
@@ -932,9 +958,46 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         intentTimer = nil
     }
 
+    /// The list opens: agents whose usage limit is over (and that have not blinked yet) blink their
+    /// mark for 30 s, or until the first click on the panel.
+    func startBlinks() {
+        let now = Date().timeIntervalSince1970
+        let over = (snapshot?.rows ?? []).filter {
+            $0.state == "waiting" && ($0.resets_at ?? .infinity) <= now && !blinkDone.contains($0.session)
+        }.map { $0.session }
+        guard !over.isEmpty else { return }
+        blinking = Set(over)
+        blinkDone.formUnion(over)
+        blinkUntil = Date().addingTimeInterval(30)
+        blinkTimer?.invalidate()
+        blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if Date() > self.blinkUntil { self.stopBlinks(); return }
+            self.blinkPhase.toggle()
+            self.applyBlink()
+        }
+    }
+
+    func stopBlinks() {
+        guard blinkTimer != nil || !blinking.isEmpty else { return }
+        blinkTimer?.invalidate()
+        blinkTimer = nil
+        blinking = []
+        blinkPhase = true
+        applyBlink()
+    }
+
+    func applyBlink() {
+        for v in rowViews {
+            let off = blinking.contains(v.row.session) && !blinkPhase
+            if v.blinkOff != off { v.blinkOff = off; v.needsDisplay = true }
+        }
+    }
+
     func expand() {
         expanded = true
         layout()
+        startBlinks()
         outsideSince = nil
         watchTimer?.invalidate()
         watchTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -974,6 +1037,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     }
 
     func collapse() {
+        stopBlinks()
         if searchMode { endSearch() }
         hidePreview()
         watchTimer?.invalidate()
@@ -1156,6 +1220,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     func startSearch(query: String = "") {
         searchMode = true
         expanded = true
+        startBlinks()
         panel.allowKey = true
         searchField.stringValue = query
         layout()
@@ -1456,6 +1521,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
                 [weak self] row in self?.raise(row)
             }
             v.onPin = { [weak self] row, on in self?.setPin(row, on) }
+            v.blinkOff = blinking.contains(r.session) && !blinkPhase  // rows are rebuilt each second
             listView.addSubview(v)
             rowViews.append(v)
             y += rowHeight

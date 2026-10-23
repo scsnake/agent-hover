@@ -20,6 +20,10 @@ WORKING, WAITING, DONE, IDLE, ENDED = "working", "waiting", "done", "idle", "end
 
 # Claude Code Notification types that mean "the person must act now".
 CLAUDE_WAITING_NOTIFICATIONS = {"permission_prompt", "elicitation_dialog", "agent_needs_input"}
+# Claude Code StopFailure errors (hooks reference): a usage or account limit needs the person
+# (wait for the reset, add credits, switch the model, sign in); other API errors just end the turn.
+CLAUDE_LIMIT_ERRORS = {"rate_limit", "billing_error"}
+CLAUDE_ACCOUNT_ERRORS = {"authentication_failed", "oauth_org_not_allowed", "account_on_hold", "cloud_credential_error"}
 # Claude Code tools that open a dialog for the person.
 CLAUDE_DIALOG_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
@@ -47,6 +51,11 @@ def map_event(agent, payload):
     if event == "Stop":
         return DONE, ""
     if event == "StopFailure":
+        error = payload.get("error", "")
+        if error in CLAUDE_LIMIT_ERRORS:
+            return WAITING, "usage limit"  # Claude may also continue by itself at the reset
+        if error in CLAUDE_ACCOUNT_ERRORS:
+            return WAITING, "sign-in or account"
         return DONE, "error"
     if event == "Interrupt":
         # The person pressed Esc, so they are at the tab already.
@@ -55,6 +64,13 @@ def map_event(agent, payload):
         kind = payload.get("notification_type", "")
         if kind in CLAUDE_WAITING_NOTIFICATIONS:
             return WAITING, kind
+        # Usage-limit waits (Claude Code 2.1.234+): it continued, waits for Enter, or gave up.
+        if kind == "quota_auto_resume_fired":
+            return WORKING, "resumed"
+        if kind == "quota_auto_resume_stale":
+            return WAITING, "usage limit"
+        if kind == "quota_auto_resume_disabled":
+            return DONE, "usage limit"
         if not kind and "permission" in payload.get("message", "").lower():
             return WAITING, "permission_prompt"
     return None
@@ -97,6 +113,8 @@ def question_text(payload, limit=1500):
             lines.append(_text(inp["description"]))
     elif event == "Notification" and payload.get("message"):
         lines.append(payload["message"])
+    elif event == "StopFailure":  # the API error text, such as "API Error: Rate limit reached"
+        lines += [_text(payload.get("last_assistant_message")), _text(payload.get("error_details"))]
     text = "\n".join(line for line in lines if line).strip()
     if not text:
         return None
@@ -158,6 +176,27 @@ def codex_turn_state(payload):
         # The Codex screen then asks whether to switch to a smaller model.
         return WAITING, "usage limit", "Codex hit its usage limit.\n" + message
     return DONE, "error", None
+
+
+def codex_resets_at(path, tail_bytes=262144):
+    """When a Codex usage limit resets (Unix time), from the last rate_limits record that has
+    limit windows: the latest reset among the windows at 95 % or more (both full: the later one),
+    else the fullest window's reset. None if not found."""
+    for line in reversed(_file_part(path, tail_bytes, tail=True).splitlines()):
+        if '"rate_limits"' not in line:
+            continue
+        try:
+            limits = (json.loads(line).get("payload") or {}).get("rate_limits") or {}
+        except (ValueError, AttributeError):
+            continue
+        windows = [w for w in (limits.get("primary"), limits.get("secondary"))
+                   if isinstance(w, dict) and isinstance(w.get("resets_at"), (int, float))]
+        if not windows:
+            continue  # for example the "premium" entry with no windows
+        full = [w for w in windows if (w.get("used_percent") or 0) >= 95]
+        pick = max(full, key=lambda w: w["resets_at"]) if full else max(windows, key=lambda w: w.get("used_percent") or 0)
+        return float(pick["resets_at"])
+    return None
 
 
 def codex_seed_state(payload):

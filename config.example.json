@@ -16,7 +16,8 @@
     "idle_min": 20,
     "working_park_s": 120,
     "cpu_hot_pct": 50,
-    "cpu_hot_min": 2
+    "cpu_hot_min": 2,
+    "notify_limit_reset": true
   },
   "agents": {
     "extra": []

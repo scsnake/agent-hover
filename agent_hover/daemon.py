@@ -114,6 +114,17 @@ def codex_main_rollout(pid):
     return found
 
 
+def notify(title, text):
+    """A macOS notification through osascript (local; the first one may ask to allow
+    notifications for Script Editor in System Settings)."""
+    script = f"display notification {json.dumps(text, ensure_ascii=False)} with title {json.dumps(title, ensure_ascii=False)}"
+    try:
+        subprocess.Popen(["osascript", "-e", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
 def with_codex_session(rec, path):
     """A seeded Codex record with the session ID, folder and state from its session file."""
     if not path:
@@ -133,6 +144,8 @@ def with_codex_session(rec, path):
         new.update(state=state, detail=detail, ts=float(when) if isinstance(when, (int, float)) else time.time())
         if question:
             new["question"] = question
+    if new.get("detail") == "usage limit" and new.get("state") == states.WAITING and not new.get("resets_at"):
+        new["resets_at"] = states.codex_resets_at(path)
     if new.get("detail") == "seen by daemon":
         new["detail"] = ""
     return new
@@ -637,6 +650,8 @@ async def run(conn, args):
     models = {}  # session -> (time read, model or None)
     usage, hot, hot_since, usage_ts = {}, {}, {}, 0.0  # session -> (cpu, MB) / bool / time hot began
     codex_paths, codex_ts = {}, 0.0  # Codex session ID -> its session file
+    daemon_cfg = states.load_config().get("daemon")
+    notify_reset = not (isinstance(daemon_cfg, dict) and daemon_cfg.get("notify_limit_reset") is False)
     update_on = states.load_config().get("update_check") is True
     update = load_update() if update_on else {}
     update_ts = update.get("checked", 0.0) if isinstance(update.get("checked"), (int, float)) else 0.0
@@ -757,9 +772,23 @@ async def run(conn, args):
                            "ts": float(ended) if isinstance(ended, (int, float)) and ended <= now else now}
                     if question:
                         new["question"] = question
+                    if detail == "usage limit":
+                        new["resets_at"] = states.codex_resets_at(codex_paths[aid])
                     states.write_state(sid, new)
                     recs[sid] = new
-                    log("codex_turn_end", session=sid, state=state, detail=detail)
+                    log("codex_turn_end", session=sid, state=state, detail=detail, resets_at=new.get("resets_at"))
+            # The usage limit is over: tell the person once (the agent does not go on by itself).
+            for sid in listed:
+                rec = recs[sid]
+                resets = rec.get("resets_at")
+                if (notify_reset and rec.get("state") == states.WAITING and isinstance(resets, (int, float))
+                        and resets <= now and not rec.get("reset_notified")):
+                    latest = states.read_state(sid) or {}
+                    if latest.get("ts") == rec.get("ts"):
+                        recs[sid] = {**rec, "reset_notified": True}
+                        states.write_state(sid, recs[sid])
+                        notify("Agent can continue", f"{names.get(sid) or rec.get('cwd') or sid}: the usage limit is over")
+                        log("limit_reset_notify", session=sid)
         if now - usage_ts > USAGE_SCAN_S:
             t = time.monotonic()
             table = await asyncio.to_thread(process_table)
@@ -782,6 +811,7 @@ async def run(conn, args):
                       "cwd": recs[sid].get("cwd") or "",
                       "detail": recs[sid].get("detail", ""),
                       "question": recs[sid].get("question") if recs[sid]["state"] == states.WAITING else None,
+                      "resets_at": recs[sid].get("resets_at") if recs[sid]["state"] == states.WAITING else None,
                       "since": since.get(sid, (None, recs[sid]["ts"]))[1],
                       "last": recs[sid]["ts"],
                       "buried": sid in buried_now, "focused": focus.has(sid),

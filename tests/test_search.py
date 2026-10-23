@@ -85,6 +85,21 @@ def test_transcript_model(tmp_path):
     assert search.transcript_model(empty) is None and search.transcript_model(tmp_path / "none") is None
 
 
+def test_transcript_model_long_turn(tmp_path):
+    # The model changed mid-session, then one long turn wrote many chunks without a "model" line.
+    codex = tmp_path / "r.jsonl"
+    filler = [{"type": "event_msg", "payload": {"type": "token_count", "n": "x" * 100}}] * 50
+    write_jsonl(codex, [{"type": "session_meta", "payload": {"model_provider": "openai", "model": "gpt-5.6-sol"}},
+                        {"type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}] + filler)
+    assert search.transcript_model(codex, chunk=1000) == "gpt-6.1-sol (openai)"
+    with open(codex, "a") as f:  # later reads see only the new end
+        f.write(json.dumps({"type": "event_msg", "payload": {"type": "agent_message"}}) + "\n")
+    assert search.transcript_model(codex, chunk=1000) == "gpt-6.1-sol (openai)"
+    with open(codex, "a") as f:
+        f.write(json.dumps({"type": "turn_context", "payload": {"model": "gpt-6.1-luna"}}) + "\n")
+    assert search.transcript_model(codex, chunk=1000) == "gpt-6.1-luna (openai)"
+
+
 def msg(text, role="user"):
     return {"type": role, "message": {"role": role, "content": [{"type": "text", "text": text}]}}
 

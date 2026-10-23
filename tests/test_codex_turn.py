@@ -65,3 +65,22 @@ def test_codex_seed_state():
     assert states.codex_seed_state({"type": "task_started"})[0] == "working"
     assert states.codex_seed_state({"type": "task_complete", "error": None})[0] == "done"
     assert states.codex_seed_state({"type": "turn_aborted"})[0] == "idle"
+
+
+def limits(primary, secondary, limit_id="codex"):
+    return json.dumps({"type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
+        "limit_id": limit_id, "primary": primary, "secondary": secondary}}})
+
+
+def test_resets_at(tmp_path):
+    f = tmp_path / "r.jsonl"
+    five = {"used_percent": 99.0, "window_minutes": 300, "resets_at": 1000}
+    week = {"used_percent": 31.0, "window_minutes": 10080, "resets_at": 9000}
+    write(f, limits(five, week), limits(None, None, "premium"))  # the empty premium entry is skipped
+    assert states.codex_resets_at(f) == 1000.0
+    write(f, limits(five, {**week, "used_percent": 100.0}))  # both full: wait for the later one
+    assert states.codex_resets_at(f) == 9000.0
+    write(f, limits({**five, "used_percent": 40.0}, {**week, "used_percent": 60.0}))  # none full: the fullest
+    assert states.codex_resets_at(f) == 9000.0
+    write(f, ev("task_started"))
+    assert states.codex_resets_at(f) is None
