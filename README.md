@@ -21,6 +21,7 @@ Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs
 | Floating panel | Hover the pill to see all agent tabs, most recent first. Click a row to raise that tab |
 | Question preview | A waiting agent has an orange `?`. Hover its row to see the question: the command to approve, the choices, or the plan |
 | Peek | Hover any other row to see the last lines of that tab's screen, without switching to it |
+| CPU and memory | Hover the agent mark at the right end of a row: the frame shows the agent, model, CPU and memory (instead of the screen) of the agent and the commands it runs. A red flame marks an agent that is not working but uses much CPU (stuck, or a command still running) |
 | "New" dot | A blue dot marks a done tab that you have not looked at yet |
 | Pin | Right-click a row → **Pin**. A pinned tab is never hidden and is listed first |
 | Search | Click the magnifier. Filter by tab name and agent folder, and optionally by chat text. Agents closed in the last 7 days show under **Closed**; a click opens a new tab in that folder with the resume command typed (press Enter to run it) |
@@ -110,10 +111,12 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 ```json
 {
   "panel":  {"font_size": 12, "list_width": 440, "hover_ms": 120,
-             "hotkey": "ctrl+opt+space", "fold_idle_h": 12, "closed_days": 7,
+             "hotkey": "ctrl+opt+space", "fold_idle_h": 12, "fold_waiting_h": 24, "closed_days": 7,
              "dock_px": 4, "dock_delay_ms": 500, "magnet_px": 24},
-  "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120},
-  "agents": {"extra": []}
+  "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120,
+             "cpu_hot_pct": 50, "cpu_hot_min": 2},
+  "agents": {"extra": []},
+  "update_check": false
 }
 ```
 
@@ -122,9 +125,13 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 - `panel.hover_ms`: the cursor must rest on the pill or bar this long (in ms) before the list opens, so a cursor that only passes over it does not open it. Default 120. `0` opens at once.
 - `panel.hotkey`: opens the list in search mode from any app, also on another desktop Space. Press it again to close. Modifiers: `ctrl`, `opt`, `cmd`, `shift`; keys: letters, digits, `space`, `return`, `tab`, `f1`–`f12` and some punctuation. `"off"` turns it off. If it does not work, another app likely uses the same keys (for example Alfred or Raycast on `opt+space`).
 - `panel.fold_idle_h`: tabs that are done or idle for more than this many hours fold into one line at the end of the list. Rest the cursor on the line, or click it, to show them. Pinned tabs, new (unseen) tabs and search results never fold. `0` turns it off.
+- `panel.fold_waiting_h`: a question left unanswered for more than this many hours also folds (an abandoned session), and no longer colors the edge bar. Default 24. `0`: waiting tabs never fold.
 - `panel.closed_days`: the search also lists agents closed in the last N days (only real sessions, not `claude -p` or `codex exec` runs). Click one: a new tab runs `cd <folder>` and types `claude --resume <id>` (or `codex resume <id>`) without Enter. `0` turns it off.
 - `panel.dock_px`, `panel.dock_delay_ms`: how sticky the screen edge is. A dragged panel docks only when you push it at least `dock_px` past the right edge and hold for `dock_delay_ms` (the blue border then shows). A small pull back undocks it.
 - `panel.magnet_px`: a dragged panel within this distance of a screen edge snaps flush to it (also right after you pull it out of the bar). Hold ⌥ (Option) while you drag for no snap. `0` turns it off.
+- `daemon.cpu_hot_pct`, `daemon.cpu_hot_min`: the red flame shows when an agent that is not working uses at least this % CPU for this many minutes. `cpu_hot_pct: 0` turns it off.
+- `update_check`: `true` checks once a day for a newer version. The pill then shows **↑ update**, and `./run.sh doctor` says so. Run `./run.sh update` to get it. Off by default.
+- Logs in `~/.agent-hover/log/` move to `<name>.1` at 5 MB; one old file is kept.
 - `agents.extra`: more job names to find (for example `qwen`). Such an agent also needs hooks that call `agent_hover/hook.py <name>` with Claude-style events.
 - Agent marks: `~/.agent-hover/agents.json`, for example `{"codex": {"mark": "◇", "color": "#10A37F"}}`.
 
@@ -135,6 +142,7 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 | `./run.sh` or `./run.sh up` | Start the daemon (`--apply`) and the panel |
 | `./run.sh down` | Stop the panel and the daemon (it unburies its tabs first). Also pauses autostart until the next `up` |
 | `./run.sh doctor` | Check the setup and print a fix for each problem |
+| `./run.sh update` | Get the new version (`git pull --ff-only`, `uv sync`) and restart the daemon and the panel if they run |
 | `./run.sh autostart on` / `off` / `status` | Start at login and whenever iTerm2 runs (a LaunchAgent); `off` removes it |
 | `./run.sh start [--apply]` | Start the daemon only. Dry run without `--apply` |
 | `./run.sh stop` | Stop the daemon only. It unburies every tab it buried first |
@@ -164,11 +172,12 @@ To undo:
 
 ## Privacy
 
-Everything stays on your Mac. There are no network calls.
+Everything stays on your Mac. There are no network calls, except the update check if you turn it on (`"update_check": true`): once a day, `git ls-remote` asks GitHub for the newest commit ID. It only shows a mark; it never downloads or installs.
 
 - The hooks store each agent's state, its folder, and the text of a pending question.
-- The chat search and the model tooltip read the agents' own transcript files (`~/.claude/projects`, `~/.codex/sessions`), only when you search or for the open tabs.
+- The chat search and the model name in the hover frame read the agents' own transcript files (`~/.claude/projects`, `~/.codex/sessions`), only when you search or for the open tabs.
 - The chat search keeps a copy of the message text (no tool output) in `~/.agent-hover/chatcache/`, so a search takes well under 0.1 s. Entries of deleted transcripts are removed at the next chat search. You can delete the folder at any time; the next search builds it again.
+- For an agent tab with no hook event yet, the daemon reads Claude Code's own process file (`~/.claude/sessions/<pid>.json`) for its session ID, folder and state. It also reads the process list (`ps`) for CPU and memory.
 - Peek reads the hovered tab's screen through iTerm2, and keeps the last lines in `~/.agent-hover/peek.json`.
 
 ## How it works

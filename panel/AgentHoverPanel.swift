@@ -4,7 +4,9 @@
 // Hover (the cursor rests on it for panel.hover_ms): it expands to a list of all agent tabs,
 // most recently active first (buried ones are dimmed and marked ▾). The order is sorted when
 // the list opens and stays while it is open.
-// Each row has an agent mark (built-in table, overridden by ~/.agent-hover/agents.json).
+// Each row has an agent mark (built-in table, overridden by ~/.agent-hover/agents.json). With the
+// cursor on that mark, the hover frame shows the agent, model, CPU and memory instead of the screen;
+// a red flame marks an agent that is not working but uses much CPU.
 // Edge bar: drag the pill past the right edge of the screen (by panel.dock_px) and hold it there for
 // panel.dock_delay_ms (an accent border then shows that a release docks it); release: the panel
 // becomes a thin bar in the color of the most urgent state (waiting > done > working). Hover the bar
@@ -103,11 +105,15 @@ struct Row: Decodable {
     var pinned: Bool?      // pinned in the panel: never parked, listed first
     let model: String?     // the model from the agent's transcript, e.g. "gpt-5.6-sol (openai)"
     let unseen: Bool?      // done, and the person has not looked at the tab since
+    let cpu: Double?       // % CPU of the agent's process tree (agent, MCP servers, its commands)
+    let mem_mb: Double?    // memory of that tree, MB
+    let hot: Bool?         // not working, but high CPU for minutes (daemon cpu_hot_pct / cpu_hot_min)
 }
 
 struct Snapshot: Decodable {
     let ts: Double
     let apply: Bool
+    let update: Bool?  // the opt-in update check found a newer version (./run.sh update)
     let rows: [Row]
 }
 
@@ -117,6 +123,7 @@ var listWidth: CGFloat = 440
 var hoverMs: Double = 120  // hover intent: the cursor must rest this long before the list opens
 var hotkeySpec = "ctrl+opt+space"  // "" or "off": no hotkey
 var foldIdleH: Double = 12  // 0: never fold
+var foldWaitingH: Double = 24  // a question unanswered this long also folds; 0: never
 var closedDays: Double = 7  // search also lists agents closed in the last N days; 0: off
 var dockPx: CGFloat = 4  // the dock zone: the drag pushes the panel this far past the screen's right edge
 var dockDelayMs: Double = 500  // a drag must stay in the dock zone this long before a release docks
@@ -140,6 +147,7 @@ func reloadPanelConfig() -> Bool {
         hoverMs = min(1000, max(0, panelCfg["hover_ms"] as? Double ?? 120))
         hotkeySpec = panelCfg["hotkey"] as? String ?? "ctrl+opt+space"
         foldIdleH = max(0, panelCfg["fold_idle_h"] as? Double ?? 12)
+        foldWaitingH = max(0, panelCfg["fold_waiting_h"] as? Double ?? 24)
         closedDays = max(0, panelCfg["closed_days"] as? Double ?? 7)
         dockPx = CGFloat(min(200, max(0, panelCfg["dock_px"] as? Double ?? 4)))
         dockDelayMs = min(5000, max(0, panelCfg["dock_delay_ms"] as? Double ?? 500))
@@ -148,6 +156,7 @@ func reloadPanelConfig() -> Bool {
         hoverMs = 120
         hotkeySpec = "ctrl+opt+space"
         foldIdleH = 12
+        foldWaitingH = 24
         closedDays = 7
         dockPx = 4
         dockDelayMs = 500
@@ -384,6 +393,32 @@ func pinIcon() -> NSImage? {
             .applying(NSImage.SymbolConfiguration(paletteColors: [.systemOrange])))
 }
 
+/// The hover frame's text when the cursor is on a row's agent mark (or its flame): agent, model,
+/// CPU and memory. Not a tooltip: the rows are rebuilt each second, and the panel never takes
+/// focus, so macOS tooltips do not show.
+func rowInfo(_ row: Row) -> String {
+    var lines = ["Agent: \(row.agent)"]
+    if let m = row.model { lines.append("Model: \(m)") }
+    if let c = row.cpu { lines.append("CPU: \(Int(c.rounded()))% (with its MCP servers and commands)") }
+    if let mb = row.mem_mb { lines.append("Memory: \(Int(mb)) MB") }
+    if row.hot == true { lines.append("High CPU while not working: stuck, or a command still running") }
+    return lines.joined(separator: "\n")
+}
+
+/// The x range (row coordinates) of a row's agent mark, and of the flame left of it when shown.
+func markHitRange(_ row: Row, width: CGFloat) -> ClosedRange<CGFloat> {
+    let markX = width - pad - ageColumnW - 6 - markColumnW / 2
+    let flameW = row.hot == true ? (flameIcon()?.size.width ?? 0) + 4 : 0
+    return (markX - markColumnW / 2 - flameW)...(markX + markColumnW / 2)
+}
+
+/// The high-CPU mark (SF Symbol, tinted).
+func flameIcon() -> NSImage? {
+    NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "high CPU")?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: fs(10), weight: .bold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [.systemRed])))
+}
+
 /// One agent tab in the expanded list. Click raises it; right-click: pin or unpin.
 final class RowView: NSView {
     let row: Row
@@ -397,7 +432,6 @@ final class RowView: NSView {
         self.note = note
         self.onClick = onClick
         super.init(frame: frame)
-        toolTip = [row.agent, row.model].compactMap { $0 }.joined(separator: " · ")
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
                                        owner: self, userInfo: nil))
     }
@@ -445,7 +479,13 @@ final class RowView: NSView {
         ageText.draw(at: NSPoint(x: bounds.width - pad - ageText.size().width, y: y + 1))
         let markX = bounds.width - pad - ageColumnW - 6 - markColumnW / 2
         drawCentered(agentBadge(row.agent), centerX: markX, y: y + 1)
-        let rightW = ageColumnW + 6 + markColumnW
+        var rightW = ageColumnW + 6 + markColumnW
+        if row.hot == true, let flame = flameIcon() {  // left of the agent mark
+            let x = markX - markColumnW / 2 - flame.size.width - 2
+            flame.draw(in: NSRect(x: x, y: (bounds.height - flame.size.height) / 2, width: flame.size.width,
+                                  height: flame.size.height))
+            rightW += flame.size.width + 4
+        }
         var label = row.name
         if let d = row.detail, !d.isEmpty, row.state == "waiting" { label += "  — \(d)" }
         let nameRect = NSRect(x: pad + fs(32), y: y, width: bounds.width - rightW - pad * 2 - fs(40), height: fs(16))
@@ -526,7 +566,7 @@ final class HotKey {
     }
 }
 
-/// The last line of the list: "▸ 5 stale (idle > 12 h)". Hover (the cursor rests on it for
+/// The last line of the list: "▸ 5 stale (idle > 12 h, waiting > 24 h)". Hover (the cursor rests on it for
 /// hover_ms; Controller.checkFoldHover) shows those rows; a click shows or hides them.
 final class FoldView: NSView {
     let count: Int
@@ -555,8 +595,10 @@ final class FoldView: NSView {
             NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).setFill()
             NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
         }
-        let hours = foldIdleH == foldIdleH.rounded() ? "\(Int(foldIdleH))" : "\(foldIdleH)"
-        let label = text("\(open ? "▾" : "▸")  \(count) stale (idle > \(hours) h)", infoColor, size: 11)
+        func h(_ v: Double) -> String { v == v.rounded() ? "\(Int(v)) h" : "\(v) h" }
+        let why = [foldIdleH > 0 ? "idle > \(h(foldIdleH))" : nil, foldWaitingH > 0 ? "waiting > \(h(foldWaitingH))" : nil]
+            .compactMap { $0 }.joined(separator: ", ")
+        let label = text("\(open ? "▾" : "▸")  \(count) stale (\(why))", infoColor, size: 11)
         label.draw(at: NSPoint(x: pad + fs(14), y: (bounds.height - label.size().height) / 2))
     }
 }
@@ -805,10 +847,11 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         }, completionHandler: { [weak self] in self?.animating = false })
     }
 
-    /// The bar's color: the most urgent state among the shown tabs.
+    /// The bar's color: the most urgent state among the shown tabs (stale ones do not count, so an
+    /// old unanswered question does not keep the bar orange).
     func barColor() -> NSColor {
         guard let snap = snapshot, fresh else { return infoColor }
-        let states = Set(snap.rows.filter { !$0.buried }.map { $0.state })
+        let states = Set(snap.rows.filter { !$0.buried && !isStale($0) }.map { $0.state })
         for s in ["waiting", "done", "working"] where states.contains(s) { return mark(s).1 }
         return infoColor
     }
@@ -962,9 +1005,11 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         else { hidePreview(); return }
         // Search mode: a chat match shows the whole matched line. A waiting agent: its question.
         // Any other row: after 0.35 s on it, "peek" = the last lines of the tab's screen.
+        let onMark = forced == nil && markHitRange(rv.row, width: rv.frame.width).contains(p.x)
         let chatLine = searchMode ? rv.note.flatMap { $0.hasPrefix("“") ? $0 : nil } : nil
-        var body = chatLine ?? (rv.row.state == "waiting"
-            ? rv.row.question ?? "Waiting for you (\(rv.row.detail ?? "no details"))." : nil)
+        var body = onMark ? rowInfo(rv.row) : chatLine ?? (rv.row.state == "waiting"
+            ? rv.row.question ?? (rv.row.detail.flatMap { $0.isEmpty ? nil : "Waiting for you (\($0))." }
+                                  ?? "Waiting for you.") : nil)
         var mono = false
         if body == nil {
             guard let lines = peekLines(for: rv.row.session) else { return }  // asked; not here yet
@@ -1300,6 +1345,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         if buried > 0 { out.append(text("▾ \(buried)", infoColor, bold: true)) }
         if out.length == 0 { out.append(text("○ \(snap.rows.count) agents", infoColor)) }
         if !snap.apply { out.append(text("  dry run", dimColor, size: 10)) }
+        if snap.update == true { out.append(text("  ↑ update", .systemBlue, size: 10)) }
         return out
     }
 
@@ -1450,10 +1496,13 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         startSearch()
     }
 
-    /// Done or idle for more than fold_idle_h hours, not pinned, not new: folded at the end.
+    /// Folded at the end (not pinned, not new): done or idle for more than fold_idle_h hours, or a
+    /// question left unanswered for more than fold_waiting_h hours (an abandoned session).
     func isStale(_ r: Row) -> Bool {
-        foldIdleH > 0 && r.pinned != true && r.unseen != true && ["done", "idle", "ended"].contains(r.state)
-            && Date().timeIntervalSince1970 - (r.last ?? r.since) > foldIdleH * 3600
+        guard r.pinned != true && r.unseen != true else { return false }
+        let hours = (Date().timeIntervalSince1970 - (r.last ?? r.since)) / 3600
+        if r.state == "waiting" { return foldWaitingH > 0 && hours > foldWaitingH }
+        return foldIdleH > 0 && ["done", "idle", "ended"].contains(r.state) && hours > foldIdleH
     }
 
     /// Pin or unpin; the daemon keeps the pins. The list sorts again, pinned rows first.

@@ -12,6 +12,7 @@
 #   ./run.sh panel       build (if needed) and start the hover panel
 #   ./run.sh panel-stop  stop the hover panel
 #   ./run.sh search [--chat] [--closed] WORD   find agent tabs by name, folder (and chat text)
+#   ./run.sh update      git pull --ff-only, uv sync, restart what was running
 set -euo pipefail
 cd "$(dirname "$0")"
 HOME_DIR="${AGENT_HOVER_HOME:-$HOME/.agent-hover}"
@@ -21,6 +22,11 @@ PAUSED="$HOME_DIR/paused"  # written by "down": autostart's supervise loop then 
 LABEL="local.agent-hover"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 mkdir -p "$HOME_DIR/log"
+
+# A program's output file over 5 MB moves to <file>.1 (one old file is kept).
+rotate() {
+  if [[ -f "$1" ]] && (( $(stat -f %z "$1") > 5242880 )); then mv -f "$1" "$1.1"; fi
+}
 
 # True only if the PID file names a live process that is our daemon (not a reused PID).
 alive() {
@@ -61,6 +67,7 @@ case "${1:-up}" in
       exit 1
     fi
     uv sync -q
+    rotate "$HOME_DIR/log/daemon.out"
     # The daemon holds an exclusive lock, so a second start exits at once (see daemon.py).
     nohup .venv/bin/python -m agent_hover.daemon "$@" >> "$HOME_DIR/log/daemon.out" 2>&1 &
     NEW=$!
@@ -105,6 +112,7 @@ case "${1:-up}" in
       mkdir -p .build
       swiftc -O -swift-version 5 panel/AgentHoverPanel.swift -o .build/agent-hover-panel
     fi
+    rotate "$HOME_DIR/log/panel.out"
     nohup .build/agent-hover-panel >> "$HOME_DIR/log/panel.out" 2>&1 &
     echo $! > "$PANEL_PID"; echo "panel started (pid $!)"
     alive || echo "note: the daemon is not running; the panel shows 'daemon off'"
@@ -115,6 +123,26 @@ case "${1:-up}" in
     else
       rm -f "$PANEL_PID"; echo "panel not running"
     fi
+    ;;
+  update)
+    git rev-parse --git-dir >/dev/null 2>&1 || { echo "not a git checkout: update by hand" >&2; exit 1; }
+    if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+      echo "local changes; commit or stash them first:" >&2; git status --short --untracked-files=no >&2; exit 1
+    fi
+    BEFORE="$(git rev-parse HEAD)"
+    git pull --ff-only
+    rm -f "$HOME_DIR/update.json"
+    if [[ "$(git rev-parse HEAD)" == "$BEFORE" ]]; then echo "already up to date"; exit 0; fi
+    git log --oneline "$BEFORE..HEAD"
+    uv sync -q
+    # The hooks run from this folder, so they use the new code at once. Restart what was running.
+    if alive; then
+      WAS="$(ps -p "$(cat "$PID")" -o command= | sed 's/.*agent_hover\.daemon *//')"
+      "$0" stop
+      # shellcheck disable=SC2086
+      "$0" start $WAS
+    fi
+    if panel_alive; then "$0" panel-stop; "$0" panel; fi
     ;;
   search)
     shift
@@ -157,6 +185,11 @@ case "${1:-up}" in
     if panel_alive; then ok "panel running (pid $(cat "$PANEL_PID"))"; else note "panel not running (./run.sh up)"; fi
     if [[ -f "$PLIST" ]]; then ok "autostart on ($PLIST)"; else note "autostart off (./run.sh autostart on)"; fi
     [[ -f "$PAUSED" ]] && note "paused by ./run.sh down (./run.sh up clears it)"
+    if grep -q '"update_check" *: *true' "$HOME_DIR/config.json" 2>/dev/null; then
+      if grep -q '"available": true' "$HOME_DIR/update.json" 2>/dev/null; then note "a newer version is available (./run.sh update)"
+      elif [[ -f "$HOME_DIR/update.json" ]]; then ok "up to date (daily update check)"
+      else note "update check on; no result yet"; fi
+    else note "update check off (optional: \"update_check\": true in $HOME_DIR/config.json)"; fi
     exit "$BAD"
     ;;
   autostart)

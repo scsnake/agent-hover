@@ -14,6 +14,7 @@ import json
 import re
 import shlex
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,10 @@ from agent_hover.rules import Config, Tab, decide
 TICK_S = 1.0
 NAME_REFRESH_S = 5.0
 MODEL_REFRESH_S = 30.0  # read each tab's model from its transcript this often
+USAGE_SCAN_S = 5.0  # CPU and memory of each agent's process tree, this often
+UPDATE_FILE = states.HOME / "update.json"
+UPDATE_EVERY_S = 86400.0  # the opt-in update check ("update_check": true in config.json), once a day
+REPO = Path(__file__).resolve().parent.parent
 SLOW_TICK_S = 0.5
 TYPING_QUIET_S = 3.0  # automatic unbury waits until no key was pressed for this long  # log a "slow_tick" line when one tick (without the wait) takes longer
 REQUEST_DIR = states.HOME / "requests"
@@ -42,6 +47,9 @@ def clean_name(name):
 
 AGENTS = ["claude", "codex"]  # plus config.json "agents": {"extra": [...]}
 SEED_SCAN_S = 5.0
+# Claude Code keeps one file per running process: {"pid", "sessionId", "cwd", "status", ...}.
+CLAUDE_SESSIONS = Path.home() / ".claude" / "sessions"
+CLAUDE_STATUS = {"busy": states.WORKING, "idle": states.IDLE, "waiting": states.WAITING}
 
 
 def detect_agent(process_title, command_line):
@@ -68,17 +76,61 @@ def seed_record(sid, agent, auto_name, path, now):
             "event": "seed", "ts": now, "agent_session": None, "cwd": path}
 
 
-async def seed_agents(app, known, checked):
-    """Add agent tabs (job claude/codex) that have no state file yet.
+def claude_session(pid):
+    """Claude Code's own file for a running process, or None."""
+    try:
+        pid = int(pid)
+        data = json.loads((CLAUDE_SESSIONS / f"{pid}.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) and data.get("pid") == pid else None
 
-    checked: session -> jobPid already looked at, so a tab is read again only when its job changes."""
+
+def with_claude_session(rec, info, now):
+    """A seeded record with the session ID, folder and state from Claude's own file (a tab with
+    no hook event yet: Claude started before the install, or its hooks do not reach us)."""
+    if not info:
+        return rec
+    new = dict(rec)
+    sid = info.get("sessionId")
+    if isinstance(sid, str) and states.UUID_RE.fullmatch(sid):
+        new["agent_session"] = sid
+    if isinstance(info.get("cwd"), str) and info["cwd"]:
+        new["cwd"] = info["cwd"]
+    state = CLAUDE_STATUS.get(info.get("status"))
+    if state and state != rec.get("state"):
+        new["state"] = state
+        changed = info.get("statusUpdatedAt")
+        new["ts"] = changed / 1000 if isinstance(changed, (int, float)) else now
+    if new.get("detail") in ("seen by daemon", "Claude session file"):
+        new["detail"] = ""  # internal notes, not for the panel (it shows a waiting row's detail)
+    return new
+
+
+async def seed_agents(app, known, checked):
+    """Add agent tabs (job claude/codex) that have no state file yet, and keep seeded Claude tabs
+    up to date from Claude's own session file (session ID, folder, busy / idle / waiting).
+
+    known: the state records. checked: session -> jobPid already looked at, so a tab with no
+    record is read again only when its job changes."""
+    now = time.time()
     for w in windows(app):
         for t in w.tabs:
             for s in t.all_sessions:
                 sid = s.session_id
-                if sid in known:
-                    continue
+                rec = known.get(sid)
+                if rec is not None and rec.get("event") != "seed":
+                    continue  # the hooks report this tab
                 pid = await s.async_get_variable("jobPid")
+                if rec is not None:
+                    if rec.get("agent") == "claude":
+                        new = with_claude_session(rec, claude_session(pid), now)
+                        latest = states.read_state(sid) or {}
+                        if new != rec and latest.get("event") == "seed":  # a hook may have just written
+                            states.write_state(sid, new)
+                            if new.get("agent_session") != rec.get("agent_session"):
+                                log("seed_session", session=sid, agent_session=new.get("agent_session"))
+                    continue
                 if checked.get(sid) == pid:
                     continue
                 checked[sid] = pid
@@ -86,17 +138,95 @@ async def seed_agents(app, known, checked):
                                      await s.async_get_variable("commandLine"))
                 if agent and not states.state_path(sid).exists():  # a hook may have just written it
                     rec = seed_record(sid, agent, await s.async_get_variable("autoName"),
-                                      await s.async_get_variable("path"), time.time())
+                                      await s.async_get_variable("path"), now)
+                    if agent == "claude":
+                        rec = with_claude_session(rec, claude_session(pid), now)
                     states.write_state(sid, rec)
-                    log("seed", session=sid, agent=agent, state=rec["state"])
+                    log("seed", session=sid, agent=agent, state=rec["state"],
+                        agent_session=rec.get("agent_session"))
 
 
-def write_panel(rows, apply):
+def process_table():
+    """pid -> (parent pid, % CPU, resident memory in KB) for all processes (one `ps` call)."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pcpu=,rss="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table = {}
+    for line in out.splitlines():
+        parts = line.split()
+        try:
+            table[int(parts[0])] = (int(parts[1]), float(parts[2]), int(parts[3]))
+        except (IndexError, ValueError):
+            continue
+    return table
+
+
+def tree_usage(table, root):
+    """(% CPU, memory in MB) of a process and all its children: the agent, its MCP servers and
+    the commands it runs. macOS %CPU is a decaying recent average."""
+    children = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    cpu = kb = 0.0
+    todo, seen = [root], set()
+    while todo:
+        pid = todo.pop()
+        if pid in seen or pid not in table:
+            continue
+        seen.add(pid)
+        cpu += table[pid][1]
+        kb += table[pid][2]
+        todo.extend(children.get(pid, []))
+    return round(cpu, 1), round(kb / 1024)
+
+
+def hot_update(hot_since, sid, state, cpu, now, cfg_pct, cfg_min):
+    """True when an agent that is not working has used cfg_pct % CPU or more for cfg_min minutes
+    (a stuck agent, or a command it left running)."""
+    if cfg_pct > 0 and cpu >= cfg_pct and state != states.WORKING:
+        start = hot_since.setdefault(sid, now)
+        return now - start >= cfg_min * 60
+    hot_since.pop(sid, None)
+    return False
+
+
+def check_update(repo=REPO):
+    """Compare this checkout's commit with the HEAD of its "origin" remote (git ls-remote: about
+    1 s, no download). Only tells; never pulls (./run.sh update does that, when the person runs it).
+    None when there is no remote or no network."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=20)
+    try:
+        if git("remote", "get-url", "origin").returncode != 0:
+            return None
+        local = git("rev-parse", "HEAD").stdout.strip()
+        found = git("ls-remote", "origin", "HEAD").stdout.split()
+        remote = found[0] if found else ""
+        if not local or not remote:
+            return None
+        # Behind: the remote commit differs and is not already in the local history.
+        behind = remote != local and git("merge-base", "--is-ancestor", remote, "HEAD").returncode != 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {"checked": time.time(), "local": local, "remote": remote, "available": behind}
+
+
+def load_update():
+    try:
+        data = json.loads(UPDATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_panel(rows, apply, update=False):
     """Snapshot for the hover panel: visible agent tabs by group, buried ones last."""
     rows.sort(key=lambda r: (r["buried"], GROUP_ORDER.get(r["state"], 9), -r["since"]))
     states.HOME.mkdir(parents=True, exist_ok=True)
     tmp = PANEL_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"ts": time.time(), "apply": apply, "rows": rows}))
+    tmp.write_text(json.dumps({"ts": time.time(), "apply": apply, "update": update, "rows": rows}))
     tmp.replace(PANEL_FILE)
 
 
@@ -404,6 +534,10 @@ async def run(conn, args):
     since = {}  # session -> (state, time the daemon first saw that state)
     names, names_ts = {}, 0.0
     models = {}  # session -> (time read, model or None)
+    usage, hot, hot_since, usage_ts = {}, {}, {}, 0.0  # session -> (cpu, MB) / bool / time hot began
+    update_on = states.load_config().get("update_check") is True
+    update = load_update() if update_on else {}
+    update_ts = update.get("checked", 0.0) if isinstance(update.get("checked"), (int, float)) else 0.0
     seed_checked, seed_ts = {}, 0.0
     log("start", apply=args.apply, n=cfg.n_active, idle_park_s=cfg.idle_park_s,
         working_park_s=cfg.working_park_s)
@@ -416,7 +550,7 @@ async def run(conn, args):
         parts["refresh"] = time.monotonic() - t0
         if now - seed_ts > SEED_SCAN_S:
             t = time.monotonic()
-            await seed_agents(app, set(states.read_states()), seed_checked)
+            await seed_agents(app, states.read_states(), seed_checked)
             parts["seed"] = time.monotonic() - t
             seed_ts = now
         recs = states.read_states()
@@ -492,6 +626,27 @@ async def run(conn, args):
                     names[sid] = clean_name(await session.async_get_variable("autoName"))
             names_ts = now
             parts["names"] = time.monotonic() - t
+        if update_on and now - update_ts > UPDATE_EVERY_S:
+            update_ts = now  # also after a failed check: try again tomorrow
+            found = await asyncio.to_thread(check_update)
+            if found:
+                update = found
+                tmp = UPDATE_FILE.with_suffix(".tmp")
+                tmp.write_text(json.dumps(update))
+                tmp.replace(UPDATE_FILE)
+            log("update_check", ok=found is not None, available=bool(found and found["available"]))
+        if now - usage_ts > USAGE_SCAN_S:
+            t = time.monotonic()
+            table = await asyncio.to_thread(process_table)
+            for sid in listed:
+                session = app.get_session_by_id(sid)
+                pid = await session.async_get_variable("jobPid") if session is not None else None
+                if isinstance(pid, int) and pid > 0:
+                    usage[sid] = tree_usage(table, pid)
+                    hot[sid] = hot_update(hot_since, sid, recs[sid]["state"], usage[sid][0], now,
+                                          args.cpu_hot_pct, args.cpu_hot_min)
+            usage_ts = now
+            parts["usage"] = time.monotonic() - t
         for sid in listed:
             if now - models.get(sid, (0, None))[0] > MODEL_REFRESH_S:
                 path = search.transcript(recs[sid].get("agent", ""), recs[sid].get("agent_session"))
@@ -505,9 +660,11 @@ async def run(conn, args):
                       "last": recs[sid]["ts"],
                       "buried": sid in buried_now, "focused": focus.has(sid),
                       "pinned": sid in pins, "model": models.get(sid, (0, None))[1],
+                      "cpu": usage.get(sid, (None, None))[0], "mem_mb": usage.get(sid, (None, None))[1],
+                      "hot": hot.get(sid, False),
                       "unseen": recs[sid]["state"] == states.DONE and not focus.has(sid)
                                 and last_focus.get(sid, 0) < recs[sid]["ts"]} for sid in listed],
-                    args.apply)
+                    args.apply, update=bool(update_on and update.get("available")))
 
         d = decide(tabs, now, cfg, focus.changed_ts, counts)
         for sid in release:
@@ -554,7 +711,8 @@ async def run(conn, args):
 
 
 DAEMON_DEFAULTS = {"n": ("n_active", 5), "idle_min": ("idle_min", 20.0),
-                   "working_park_s": ("working_park_s", 120.0)}
+                   "working_park_s": ("working_park_s", 120.0),
+                   "cpu_hot_pct": ("cpu_hot_pct", 50.0), "cpu_hot_min": ("cpu_hot_min", 2.0)}
 
 
 def apply_config(args, config):
@@ -580,6 +738,9 @@ def main():
     p.add_argument("--idle-min", type=float, help="park a seen done/idle tab after N minutes (default 20)")
     p.add_argument("--working-park-s", type=float,
                    help="park a working tab N s after it lost focus (default 120)")
+    p.add_argument("--cpu-hot-pct", type=float,
+                   help="mark an agent that is not working but uses this %% CPU or more (default 50; 0: off)")
+    p.add_argument("--cpu-hot-min", type=float, help="... for this many minutes (default 2)")
     p.add_argument("--only-window", action="append", default=[],
                    help="manage only this iTerm2 window id (repeatable; for tests)")
     args = p.parse_args()

@@ -211,7 +211,16 @@ def read_states(max_age_s=2 * 86400):
     return out
 
 
+LOG_MAX_BYTES = 5 * 1024 * 1024  # then the log moves to <name>.1 (one old file is kept)
+
+
 def append_log(name, record):
     ensure_dir(LOG_DIR)
-    with open(LOG_DIR / name, "a") as f:
+    path = LOG_DIR / name
+    try:
+        if path.stat().st_size > LOG_MAX_BYTES:
+            os.replace(path, path.with_name(name + ".1"))
+    except OSError:
+        pass
+    with open(path, "a") as f:
         f.write(json.dumps(record) + "\n")
