@@ -11,7 +11,7 @@
 #   ./run.sh log         follow the decision log
 #   ./run.sh panel       build (if needed) and start the hover panel
 #   ./run.sh panel-stop  stop the hover panel
-#   ./run.sh search [--chat] WORD   find agent tabs by name, folder (and chat text)
+#   ./run.sh search [--chat] [--closed] WORD   find agent tabs by name, folder (and chat text)
 set -euo pipefail
 cd "$(dirname "$0")"
 HOME_DIR="${AGENT_HOVER_HOME:-$HOME/.agent-hover}"

@@ -12,6 +12,7 @@ import ctypes
 import fcntl
 import json
 import re
+import shlex
 import signal
 import sys
 import time
@@ -310,7 +311,8 @@ async def handle_requests(app, ours, last_focus):
     from then on, so an idle tab is buried again after idle_park_s without focus.
     Works in dry run too: it is the person's own action.
     "pin" / "unpin" (panel right-click): a pinned tab is never parked; the rules raise it
-    if it is buried."""
+    if it is buried.
+    "resume" (a closed agent in the panel's search): see open_resume_tab."""
     buried_now = {x.session_id for x in app.buried_sessions}
     for f in pending_requests():
         try:
@@ -328,6 +330,9 @@ async def handle_requests(app, ours, last_focus):
             save_pins(pins)
             log(req["action"], session=sid)
             continue
+        if req.get("action") == "resume":
+            await open_resume_tab(app, req)
+            continue
         if req.get("action") != "raise" or not sid:
             continue
         was_buried = sid in buried_now
@@ -344,6 +349,28 @@ async def handle_requests(app, ours, last_focus):
         last_focus[sid] = time.time()
         log("raise_request", session=sid, found=True, was_buried=was_buried,
             lag_s=round(time.time() - req.get("ts", time.time()), 2))
+
+
+async def open_resume_tab(app, req):
+    """A new tab in the front window: run `cd <folder>`, then type the agent's resume command
+    without Enter, so the person checks it and starts it. The request names only the agent, the
+    session ID and the folder; the command is built here, so a request file cannot type other text."""
+    agent, sid, cwd = req.get("agent"), str(req.get("agent_session", "")), str(req.get("cwd", ""))
+    if agent not in ("claude", "codex") or not states.UUID_RE.fullmatch(sid) or not Path(cwd).is_dir():
+        log("resume_request", ok=False, agent=agent, agent_session=sid, cwd=cwd)
+        return
+    window = app.current_terminal_window
+    if window is not None:
+        session = (await window.async_create_tab()).current_session
+    else:
+        window = await iterm2.Window.async_create(app.connection)
+        session = window.current_session
+    await asyncio.sleep(0.5)  # let the new shell start, so it reads the typed text at its prompt
+    await session.async_send_text(f"cd {shlex.quote(cwd)}\n")
+    await session.async_send_text(search.resume_command(agent, sid, ""))
+    await session.async_activate(select_tab=True, order_window_front=True)
+    await app.async_activate(raise_all_windows=False, ignoring_other_apps=True)
+    log("resume_request", ok=True, agent=agent, agent_session=sid, new_session=session.session_id)
 
 
 async def restore_all(app):

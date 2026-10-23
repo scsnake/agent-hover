@@ -83,3 +83,108 @@ def test_transcript_model(tmp_path):
     empty = tmp_path / "e.jsonl"
     write_jsonl(empty, [{"type": "user"}])
     assert search.transcript_model(empty) is None and search.transcript_model(tmp_path / "none") is None
+
+
+def msg(text, role="user"):
+    return {"type": role, "message": {"role": role, "content": [{"type": "text", "text": text}]}}
+
+
+def test_cache_reads_only_new_complete_lines(tmp_path):
+    f = tmp_path / "S.jsonl"
+    write_jsonl(f, [msg("first invoice")])
+    assert search.search_chat(f, "invoice") == (1, "first invoice")
+    with open(f, "a") as out:  # one complete line and one still being written
+        out.write(json.dumps(msg("second\ninvoice")) + "\n" + json.dumps(msg("third invoice"))[:20])
+    assert search.search_chat(f, "invoice") == (2, "second invoice")
+    with open(f, "a") as out:
+        out.write(json.dumps(msg("third invoice"))[20:] + "\n")
+    assert search.search_chat(f, "invoice") == (3, "third invoice")
+    text_file, _ = search._cache_files(f)
+    assert text_file.read_text() == "first invoice\nsecond invoice\nthird invoice\n"
+
+
+def test_cache_rebuilds_a_cut_transcript(tmp_path):
+    f = tmp_path / "S.jsonl"
+    write_jsonl(f, [msg("old invoice"), msg("more old invoice text")])
+    assert search.search_chat(f, "invoice")[0] == 2
+    write_jsonl(f, [msg("new")])
+    assert search.search_chat(f, "invoice") == (0, None)
+    assert search.search_chat(f, "new") == (1, "new")
+
+
+def test_cache_drops_text_from_a_stopped_run(tmp_path):
+    f = tmp_path / "S.jsonl"
+    write_jsonl(f, [msg("one invoice")])
+    search.search_chat(f, "invoice")
+    text_file, _ = search._cache_files(f)
+    with open(text_file, "a") as out:
+        out.write("half-written invoice\n")  # text appended, index not saved
+    with open(f, "a") as out:
+        out.write(json.dumps(msg("two invoice")) + "\n")
+    assert search.search_chat(f, "invoice") == (2, "two invoice")
+
+
+def test_prune_removes_entries_of_deleted_transcripts(tmp_path):
+    f = tmp_path / "S.jsonl"
+    write_jsonl(f, [msg("x")])
+    search.search_chat(f, "x")
+    text_file, index_file = search._cache_files(f)
+    assert text_file.exists() and index_file.exists()
+    f.unlink()
+    search.prune_cache()
+    assert not text_file.exists() and not index_file.exists()
+
+
+def test_cached_and_raw_search_agree(tmp_path):
+    f = tmp_path / "c.jsonl"
+    write_jsonl(f, CLAUDE, ensure_ascii=True)
+    for kw in ("invoice", "測試專案", "plan.md", "nothing"):
+        assert search.search_chat(f, kw) == search.search_chat_raw(f, kw)
+
+
+def test_cache_drops_stray_text_when_nothing_is_new(tmp_path):
+    f = tmp_path / "S.jsonl"
+    write_jsonl(f, [msg("one invoice")])
+    search.search_chat(f, "invoice")
+    text_file, _ = search._cache_files(f)
+    with open(text_file, "a") as out:
+        out.write("half-written invoice\n")
+    assert search.search_chat(f, "invoice") == (1, "one invoice")
+
+
+def test_closed_sessions(tmp_path, monkeypatch):
+    monkeypatch.setattr(search, "CLAUDE_PROJECTS", tmp_path / "projects")
+    monkeypatch.setattr(search, "CODEX_SESSIONS", tmp_path / "sessions")
+    proj = tmp_path / "projects" / "-Users-x"
+    base = {"cwd": "/w/app", "entrypoint": "cli"}
+    write_jsonl(proj / "A.jsonl", [{**base, **msg("fix the invoice export")},
+                                   {"type": "ai-title", "aiTitle": "Invoice export"},
+                                   {"type": "custom-title", "customTitle": "My invoices"}])
+    write_jsonl(proj / "LIVE.jsonl", [{**base, **msg("invoice live")}])
+    write_jsonl(proj / "P.jsonl", [{"cwd": "/w", "entrypoint": "sdk-cli", **msg("invoice from claude -p")}])
+    write_jsonl(proj / "OLD.jsonl", [{**base, **msg("invoice old")},
+                                     {"type": "continued-in", "continuedInSessionId": "NEW"}])
+    write_jsonl(proj / "SEEDED.jsonl", [{**base, **msg("invoice seeded")},
+                                        {"type": "ai-title", "aiTitle": "Seeded tab"}])
+    sid = "01a1636b-aa7d-7b41-b7be-a6f37ad7e4aa"
+    day = tmp_path / "sessions" / "2026" / "10" / "22"
+    write_jsonl(day / f"rollout-2026-10-22T10-00-00-{sid}.jsonl", [
+        {"type": "session_meta", "payload": {"id": sid, "cwd": "/w/tool", "source": "cli"}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "<environment_context>x</environment_context>"},
+            {"type": "input_text", "text": "rename the invoice list"}]}}])
+    write_jsonl(day / "rollout-2026-10-22T11-00-00-01a1636b-aa7d-7b41-b7be-a6f37ad7e4ab.jsonl", [
+        {"type": "session_meta", "payload": {"cwd": "/w", "originator": "codex_exec", "source": "exec"}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                              "content": [{"type": "input_text", "text": "invoice review"}]}}])
+    tabs = [{"session": "T1", "name": "x", "agent": "claude", "cwd": "", "agent_session": "LIVE"},
+            {"session": "T2", "name": "Seeded tab", "agent": "claude", "cwd": "", "agent_session": None}]
+    found = search.search_closed("invoice", chat=True, days=7, tabs=tabs)
+    by_id = {c["agent_session"]: c for c in found}
+    assert set(by_id) == {"A", sid}
+    assert by_id["A"]["name"] == "My invoices" and by_id["A"]["where"] == ["name", "chat"]
+    assert by_id["A"]["resume"] == "cd /w/app && claude --resume A"
+    assert by_id[sid]["name"] == "rename the invoice list"
+    assert by_id[sid]["resume"] == f"cd /w/tool && codex resume {sid}"
+    assert search.search_closed("app", days=7, tabs=tabs)[0]["where"] == ["folder"]
+    assert search.search_closed("invoice", days=0, tabs=tabs) == []

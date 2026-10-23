@@ -5,12 +5,17 @@
 // most recently active first (buried ones are dimmed and marked ▾). The order is sorted when
 // the list opens and stays while it is open.
 // Each row has an agent mark (built-in table, overridden by ~/.agent-hover/agents.json).
-// Edge bar: drag the pill to the right edge of the screen (an accent border shows the dock zone)
-// and release: the panel becomes a thin bar in the color of the most urgent state
-// (waiting > done > working); hover the bar for the full panel; drag the pill away to undock.
+// Edge bar: drag the pill past the right edge of the screen (by panel.dock_px) and hold it there for
+// panel.dock_delay_ms (an accent border then shows that a release docks it); release: the panel
+// becomes a thin bar in the color of the most urgent state (waiting > done > working). Hover the bar
+// for the full panel; drag the bar or the pill away from the edge to undock.
+// Magnet: a dragged panel within panel.magnet_px of a screen edge snaps flush to it (also a panel
+// just pulled out of the bar). Hold ⌥ (Option) while dragging: no magnet.
 // Search: the magnifier on the open list starts search mode: the panel takes the keyboard and
 // filters the rows by tab name and agent folder; the "chat" switch also searches the chat text
-// (agent_hover/search.py). Esc, a click outside or a click on a row ends it; Enter raises the first row.
+// (agent_hover/search.py). Recently closed agents (panel.closed_days) that match are listed under
+// "Closed"; a click opens a new tab in its folder with the resume command typed (not run). Esc, a click outside or a click on a row ends it;
+// Enter raises the first row.
 // Click a row: ask the daemon to raise that tab (unbury, select, bring iTerm2 front).
 // Hotkey (panel.hotkey, default ctrl+opt+space): open the list in search mode from anywhere.
 // Stale tabs (done or idle for more than panel.fold_idle_h hours) fold into one line at the end.
@@ -112,6 +117,10 @@ var listWidth: CGFloat = 440
 var hoverMs: Double = 120  // hover intent: the cursor must rest this long before the list opens
 var hotkeySpec = "ctrl+opt+space"  // "" or "off": no hotkey
 var foldIdleH: Double = 12  // 0: never fold
+var closedDays: Double = 7  // search also lists agents closed in the last N days; 0: off
+var dockPx: CGFloat = 4  // the dock zone: the drag pushes the panel this far past the screen's right edge
+var dockDelayMs: Double = 500  // a drag must stay in the dock zone this long before a release docks
+var magnetPx: CGFloat = 24  // a dragged panel this close to a screen edge snaps flush to it; 0: off
 func fs(_ base: CGFloat) -> CGFloat { (base * fontSize / 12).rounded() }
 var pillHeight: CGFloat { fs(26) }
 var rowHeight: CGFloat { fs(22) }
@@ -131,10 +140,18 @@ func reloadPanelConfig() -> Bool {
         hoverMs = min(1000, max(0, panelCfg["hover_ms"] as? Double ?? 120))
         hotkeySpec = panelCfg["hotkey"] as? String ?? "ctrl+opt+space"
         foldIdleH = max(0, panelCfg["fold_idle_h"] as? Double ?? 12)
+        closedDays = max(0, panelCfg["closed_days"] as? Double ?? 7)
+        dockPx = CGFloat(min(200, max(0, panelCfg["dock_px"] as? Double ?? 4)))
+        dockDelayMs = min(5000, max(0, panelCfg["dock_delay_ms"] as? Double ?? 500))
+        magnetPx = CGFloat(min(200, max(0, panelCfg["magnet_px"] as? Double ?? 24)))
     } else {
         hoverMs = 120
         hotkeySpec = "ctrl+opt+space"
         foldIdleH = 12
+        closedDays = 7
+        dockPx = 4
+        dockDelayMs = 500
+        magnetPx = 24
     }
     let changed = size != fontSize || width != listWidth
     fontSize = size
@@ -219,6 +236,7 @@ final class Panel: NSPanel {
 /// a click (no move) raises the pill's tab.
 final class PillView: NSView {
     var content = NSAttributedString()
+    var onDragBegin: (() -> Void)?
     var onDragMove: (() -> Void)?
     var onDragEnd: (() -> Void)?
     var onClick: (() -> Void)?
@@ -230,23 +248,124 @@ final class PillView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    // Own drag loop (not performDrag), so a click and a drag can be told apart. The 1 s refresh
-    // timer does not run in this loop, so it cannot move the panel back during the drag.
     override func mouseDown(with event: NSEvent) {
-        guard let win = window else { return }
-        let start = NSEvent.mouseLocation
-        let origin = win.frame.origin
-        var moved = false
-        while let e = win.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
-            let p = NSEvent.mouseLocation
-            if !moved && hypot(p.x - start.x, p.y - start.y) > 3 { moved = true }
-            if moved {
-                win.setFrameOrigin(NSPoint(x: origin.x + p.x - start.x, y: origin.y + p.y - start.y))
-                onDragMove?()
-            }
-            if e.type == .leftMouseUp { break }
+        if let win = window {
+            dragLoop(win, onBegin: onDragBegin, onMove: onDragMove, onEnd: onDragEnd, onClick: onClick)
         }
-        if moved { onDragEnd?() } else { onClick?() }
+    }
+}
+
+/// Own drag loop (not performDrag), so a click and a drag can be told apart. The 1 s refresh
+/// timer does not run in this loop, so it cannot move the panel back during the drag. The loop
+/// also wakes every 50 ms with no mouse event, so onMove can time how long the panel rests.
+/// onBegin may resize the window (the edge bar turns into the pill): the move goes on from there.
+func dragLoop(_ win: NSWindow, onBegin: (() -> Void)?, onMove: (() -> Void)?, onEnd: (() -> Void)?,
+              onClick: (() -> Void)?) {
+    var start = NSEvent.mouseLocation
+    var origin = win.frame.origin
+    var moved = false
+    while true {
+        let e = win.nextEvent(matching: [.leftMouseDragged, .leftMouseUp], until: Date(timeIntervalSinceNow: 0.05),
+                              inMode: .eventTracking, dequeue: true)
+        let p = NSEvent.mouseLocation
+        if !moved && hypot(p.x - start.x, p.y - start.y) > 3 {
+            moved = true
+            onBegin?()
+            if win.frame.origin != origin {  // resized by onBegin: keep the cursor's place on the panel
+                origin = NSPoint(x: p.x - win.frame.width + 12, y: p.y - win.frame.height + 8)
+                start = p
+            }
+        }
+        if moved {
+            win.setFrameOrigin(NSPoint(x: origin.x + p.x - start.x, y: origin.y + p.y - start.y))
+            onMove?()
+        }
+        if e?.type == .leftMouseUp { break }
+    }
+    if moved { onEnd?() } else { onClick?() }
+}
+
+/// The edge bar. A drag pulls the panel out (as the pill); see Controller.dragMoved for the rule.
+final class BarView: NSView {
+    var onDragBegin: (() -> Void)?
+    var onDragMove: (() -> Void)?
+    var onDragEnd: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        if let win = window { dragLoop(win, onBegin: onDragBegin, onMove: onDragMove, onEnd: onDragEnd, onClick: nil) }
+    }
+}
+
+/// A recently closed agent from the search (agent_hover/search.py --closed).
+struct ClosedHit {
+    let name: String
+    let agent: String
+    let agentSession: String
+    let cwd: String
+    let last: Double
+    let resume: String
+    let note: String?  // the chat snippet, or the folder when only the folder matched
+}
+
+/// One closed agent in the search results, dimmed. A click resumes it in a new tab (Controller.resume).
+final class ClosedRowView: NSView {
+    let hit: ClosedHit
+    let onClick: (ClosedHit) -> Void
+    private var hover = false
+
+    init(hit: ClosedHit, frame: NSRect, onClick: @escaping (ClosedHit) -> Void) {
+        self.hit = hit
+        self.onClick = onClick
+        super.init(frame: frame)
+        toolTip = "Click: a new tab in its folder, with this command typed (press Enter to run it)\n\(hit.resume)"
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseEntered(with event: NSEvent) { hover = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hover = false; needsDisplay = true }
+    override func mouseDown(with event: NSEvent) { onClick(hit) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hover {
+            NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
+        }
+        let y = (bounds.height - fs(15)) / 2
+        drawCentered(text("○", dimColor), centerX: pad + fs(20), y: y)
+        let ageText = text(age(hit.last), dimColor, size: 11)
+        ageText.draw(at: NSPoint(x: bounds.width - pad - ageText.size().width, y: y + 1))
+        drawCentered(agentBadge(hit.agent), centerX: bounds.width - pad - ageColumnW - 6 - markColumnW / 2, y: y + 1)
+        let rightW = ageColumnW + 6 + markColumnW
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingTail
+        let s = NSMutableAttributedString(string: hit.name, attributes: [
+            .font: NSFont.systemFont(ofSize: fs(12)), .foregroundColor: dimColor, .paragraphStyle: style,
+        ])
+        if let note = hit.note {
+            s.append(NSAttributedString(string: "  \(note)", attributes: [
+                .font: NSFont.systemFont(ofSize: fs(11)), .foregroundColor: infoColor, .paragraphStyle: style,
+            ]))
+        }
+        s.draw(in: NSRect(x: pad + fs(32), y: y, width: bounds.width - rightW - pad * 2 - fs(40), height: fs(16)))
+    }
+}
+
+/// The "Closed" heading above the closed agents in the search results.
+final class HeadingView: NSView {
+    let label: String
+    init(label: String, frame: NSRect) {
+        self.label = label
+        super.init(frame: frame)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func draw(_ dirtyRect: NSRect) {
+        let t = text(label, infoColor, bold: true, size: 11)
+        t.draw(at: NSPoint(x: pad + fs(14), y: (bounds.height - t.size().height) / 2))
     }
 }
 
@@ -500,6 +619,11 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     let searchStatus = NSTextField(labelWithString: "")
     var searchMode = false
     var chatResults: [String: String?] = [:]  // session -> chat snippet, for chatQuery
+    var closedResults: [ClosedHit] = []  // recently closed agents that match chatQuery
+    var closedViews: [NSView] = []
+    var statusNote: (text: String, since: Date)?  // a short message in the search bar ("copied")
+    var dockArmed = false  // during a drag: a release now docks the panel
+    var zoneSince: Date?   // during a drag: when the panel came into the dock zone
     var chatQuery = ""
     var chatBusy = false
     var chatProcess: Process?
@@ -507,7 +631,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
 
     var anchor = NSPoint.zero  // top-right corner of the panel, in screen coordinates
     var docked = false         // edge bar mode: at the right edge of the screen
-    let barView = NSView()     // the thin bar, shown when docked and not expanded
+    let barView = BarView()    // the thin bar, shown when docked and not expanded
     let barW: CGFloat = 6
 
     override init() {
@@ -529,8 +653,12 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         root.layer?.cornerRadius = 9
         root.layer?.masksToBounds = true
         root.onHover = { [weak self] inside in self?.hover(inside) }
+        pill.onDragBegin = { [weak self] in self?.dragBegan() }
         pill.onDragMove = { [weak self] in self?.dragMoved() }
         pill.onDragEnd = { [weak self] in self?.dragEnded() }
+        barView.onDragBegin = { [weak self] in self?.barDragBegan() }
+        barView.onDragMove = { [weak self] in self?.dragMoved() }
+        barView.onDragEnd = { [weak self] in self?.dragEnded() }
         pill.onClick = { [weak self] in
             if let self = self, let r = self.pillRow { self.raise(r) }
         }
@@ -579,29 +707,81 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             return NSPoint(x: x, y: y)
         }
         let f = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
-        return NSPoint(x: f.maxX - 8, y: f.maxY - 8)
+        return NSPoint(x: f.maxX, y: f.maxY)  // the top-right corner, flush
     }
 
-    /// Dock zone: the panel's right side is within 12 px of the screen's right edge.
+    /// Dock zone: the drag pushes the panel's right side at least dock_px past the screen's right
+    /// edge (the raw position, before the magnet). A panel that only sits flush at the edge is not in it.
     func inDockZone() -> Bool {
         guard let vis = (panel.screen ?? NSScreen.main)?.visibleFrame else { return false }
-        return panel.frame.maxX >= vis.maxX - 12
+        return panel.frame.maxX >= vis.maxX + dockPx
     }
 
-    /// During a drag: an accent border tells that a release here docks the panel.
+    /// A drag of the pill starts. A docked panel starts armed: it stays docked unless pulled out.
+    func dragBegan() {
+        dockArmed = docked && inDockZone()
+        zoneSince = dockArmed ? Date() : nil
+        showArmed()
+    }
+
+    /// A drag of the bar starts: the bar turns into the pill under the cursor, still armed.
+    func barDragBegan() {
+        stopIntent()
+        docked = false
+        expanded = false
+        layout()
+        dockArmed = true
+        zoneSince = Date()
+        showArmed()
+    }
+
+    /// During a drag (also every 50 ms while the mouse rests): the panel must stay in the dock zone
+    /// for dock_delay_ms before a release docks it; out of the zone, it is not armed at once.
+    /// So docking needs a push past the edge and a short hold; a small pull back undocks (panel
+    /// preferred).
     func dragMoved() {
-        let zone = inDockZone()
-        root.layer?.borderWidth = zone ? 2 : 0
+        if inDockZone() {
+            let now = Date()
+            if zoneSince == nil { zoneSince = now }
+            if now.timeIntervalSince(zoneSince!) >= dockDelayMs / 1000 { dockArmed = true }
+        } else {
+            zoneSince = nil
+            dockArmed = false
+        }
+        if magnetPx > 0 && !NSEvent.modifierFlags.contains(.option) { snapToEdges() }
+        showArmed()
+    }
+
+    /// Magnet: an edge of the panel within magnet_px of a screen edge (or past it) snaps flush to
+    /// it. The drag loop sets the raw position before each call, so the snap never adds up, and
+    /// inDockZone reads that raw position first: a push past the edge still docks.
+    func snapToEdges() {
+        guard let vis = (panel.screen ?? NSScreen.main)?.visibleFrame else { return }
+        var f = panel.frame
+        if vis.maxX - f.maxX < magnetPx { f.origin.x = vis.maxX - f.width }
+        else if f.minX - vis.minX < magnetPx { f.origin.x = vis.minX }
+        if f.minY - vis.minY < magnetPx { f.origin.y = vis.minY }
+        if vis.maxY - f.maxY < magnetPx { f.origin.y = vis.maxY - f.height }  // top wins
+        if f.origin != panel.frame.origin { panel.setFrameOrigin(f.origin) }
+    }
+
+    /// The accent border: a release now docks the panel.
+    func showArmed() {
+        root.layer?.borderWidth = dockArmed ? 2 : 0
         root.layer?.borderColor = NSColor.controlAccentColor.cgColor
     }
 
-    /// A drag ended: in the dock zone, the panel shrinks into the edge bar at once
-    /// (no wait for the cursor to leave); elsewhere it stays where it was dropped.
+    /// A drag ended: armed, the panel shrinks into the edge bar at once (no wait for the cursor to
+    /// leave); otherwise it stays where it was dropped, kept inside the screen.
     func dragEnded() {
         root.layer?.borderWidth = 0
         savePosition()
-        docked = inDockZone()
-        if docked, let vis = (panel.screen ?? NSScreen.main)?.visibleFrame { anchor.x = vis.maxX }
+        docked = dockArmed
+        dockArmed = false
+        zoneSince = nil
+        if let vis = (panel.screen ?? NSScreen.main)?.visibleFrame {
+            anchor.x = docked ? vis.maxX : min(anchor.x, vis.maxX)
+        }
         savePosition(keepAnchor: true)
         if !docked { layout(); return }
         if searchMode { endSearch() }
@@ -921,6 +1101,8 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         searchField.stringValue = ""
         chatToggle.state = .off
         chatResults = [:]
+        closedResults = []
+        statusNote = nil
         chatQuery = ""
         chatTimer?.invalidate()
         chatProcess?.terminate()
@@ -937,6 +1119,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     var query: String { searchField.stringValue.trimmingCharacters(in: .whitespaces) }
 
     func controlTextDidChange(_ obj: Notification) {
+        if query.count < 2 { closedResults = [] }
         layout()
         scheduleChat()
     }
@@ -963,7 +1146,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     /// Chat search runs agent_hover/search.py (0.1–1 s), 0.4 s after the last key.
     func scheduleChat() {
         chatTimer?.invalidate()
-        guard searchMode, chatToggle.state == .on, query.count >= 2, query != chatQuery else { return }
+        guard searchMode, chatToggle.state == .on || closedDays > 0, query.count >= 2, query != chatQuery else { return }
         chatTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in self?.runChat() }
     }
 
@@ -972,7 +1155,8 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         chatProcess?.terminate()
         let p = Process()
         p.executableURL = searchPython
-        p.arguments = ["-m", "agent_hover.search", "--chat", "--json", q]
+        p.arguments = ["-m", "agent_hover.search", "--json"] + (chatToggle.state == .on ? ["--chat"] : [])
+            + (closedDays > 0 ? ["--closed"] : []) + [q]
         p.currentDirectoryURL = projectRoot
         let out = Pipe()
         p.standardOutput = out
@@ -989,13 +1173,26 @@ final class Controller: NSObject, NSSearchFieldDelegate {
                 self.chatBusy = false
                 self.chatProcess = nil
                 var found: [String: String?] = [:]
-                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let results = obj["results"] as? [[String: Any]] {
-                    for r in results where (r["where"] as? [String])?.contains("chat") == true {
+                var closed: [ClosedHit] = []
+                let home = FileManager.default.homeDirectoryForCurrentUser.path
+                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    for r in obj["results"] as? [[String: Any]] ?? []
+                    where (r["where"] as? [String])?.contains("chat") == true {
                         if let s = r["session"] as? String { found[s] = r["snippet"] as? String }
+                    }
+                    for c in obj["closed"] as? [[String: Any]] ?? [] {
+                        let cwd = c["cwd"] as? String ?? ""
+                        let folder = cwd.hasPrefix(home) ? "~" + cwd.dropFirst(home.count) : cwd
+                        let note = (c["snippet"] as? String).map { "“\($0)”" }
+                            ?? ((c["where"] as? [String])?.contains("folder") == true ? folder : nil)
+                        closed.append(ClosedHit(name: c["name"] as? String ?? "?", agent: c["agent"] as? String ?? "",
+                                                agentSession: c["agent_session"] as? String ?? "",
+                                                cwd: cwd, last: c["last"] as? Double ?? 0,
+                                                resume: c["resume"] as? String ?? "", note: note))
                     }
                 }
                 self.chatResults = found
+                self.closedResults = closed
                 self.chatQuery = q
                 self.layout()
             }
@@ -1120,6 +1317,8 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         rowViews = []
         foldView?.removeFromSuperview()
         foldView = nil
+        closedViews.forEach { $0.removeFromSuperview() }
+        closedViews = []
         let all = expanded && fresh ? sorted(rowsWithPendingPins(snapshot?.rows ?? [])) : []  // no stale list when the daemon is off
         var rows = filtered(all)
         // Search shows every match; otherwise stale rows go after one fold line.
@@ -1130,7 +1329,8 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         let barH: CGFloat = searchMode ? fs(30) : 0
         let width = open ? max(pillW, listWidth) : pillW
         let screen = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: anchor.x - 1, y: anchor.y - 1)) })
-        let lines = rows.count + (stale.isEmpty ? 0 : 1)
+        let closed = searchMode && chatQuery == query && query.count >= 2 ? closedResults : []
+        let lines = rows.count + (stale.isEmpty ? 0 : 1) + (closed.isEmpty ? 0 : closed.count + 1)
         let docH = lines == 0 ? 0 : CGFloat(lines) * rowHeight + 6
         // A long list stops at the screen's visible height; the rest scrolls.
         let maxListH = max(rowHeight * 3, (screen?.visibleFrame.height ?? 800) - pillHeight - barH - 16)
@@ -1152,7 +1352,9 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         for v in [searchField, chatToggle, searchStatus] as [NSView] { v.isHidden = !searchMode }
         if searchMode {
             let barY = height - pillHeight - barH + 3
-            searchStatus.stringValue = chatBusy ? "searching…" : query.isEmpty ? "" : "\(rows.count) found"
+            if let n = statusNote, Date().timeIntervalSince(n.since) > 2.9 { statusNote = nil }
+            searchStatus.stringValue = statusNote?.text ?? (chatBusy ? "searching…" : query.isEmpty ? ""
+                : closed.isEmpty ? "\(rows.count) found" : "\(rows.count) + \(closed.count) closed")
             searchStatus.frame = NSRect(x: width - pad - fs(74), y: barY + 3, width: fs(74), height: fs(16))
             chatToggle.frame = NSRect(x: width - pad - fs(130), y: barY + 1, width: fs(56), height: fs(20))
             searchField.frame = NSRect(x: pad, y: barY, width: width - pad * 3 - fs(130), height: fs(24))
@@ -1183,6 +1385,22 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             y += rowHeight
         }
         if !stale.isEmpty && foldAt == rows.count { addFold() }
+        if !closed.isEmpty {
+            let days = closedDays == closedDays.rounded() ? "\(Int(closedDays))" : "\(closedDays)"
+            let h = HeadingView(label: "Closed · last \(days) days · click: resume in a new tab",
+                                frame: NSRect(x: 0, y: y, width: width, height: rowHeight))
+            listView.addSubview(h)
+            closedViews.append(h)
+            y += rowHeight
+            for hit in closed {
+                let v = ClosedRowView(hit: hit, frame: NSRect(x: 0, y: y, width: width, height: rowHeight)) {
+                    [weak self] hit in self?.resume(hit)
+                }
+                listView.addSubview(v)
+                closedViews.append(v)
+                y += rowHeight
+            }
+        }
         pill.needsDisplay = true
         root.needsDisplay = true
     }
@@ -1209,6 +1427,13 @@ final class Controller: NSObject, NSSearchFieldDelegate {
 
     func raise(_ row: Row) {
         sendRequest("raise", row.session)
+        collapse()
+    }
+
+    /// A closed agent: the daemon opens a new tab, runs `cd <folder>` and types the resume
+    /// command without Enter.
+    func resume(_ hit: ClosedHit) {
+        sendRequest("resume", "", extra: ["agent": hit.agent, "agent_session": hit.agentSession, "cwd": hit.cwd])
         collapse()
     }
 
@@ -1252,12 +1477,16 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         }
     }
 
-    func sendRequest(_ action: String, _ session: String) {
+    func sendRequest(_ action: String, _ session: String, extra: [String: String] = [:]) {
         try? FileManager.default.createDirectory(at: requestDir, withIntermediateDirectories: true)
         let id = UUID().uuidString
-        let body = "{\"action\": \"\(action)\", \"session\": \"\(session)\", \"ts\": \(Date().timeIntervalSince1970)}"
+        var obj: [String: Any] = extra
+        obj["action"] = action
+        obj["session"] = session
+        obj["ts"] = Date().timeIntervalSince1970
+        guard let body = try? JSONSerialization.data(withJSONObject: obj) else { return }
         let tmp = requestDir.appendingPathComponent(".\(id).tmp")
-        try? body.data(using: .utf8)?.write(to: tmp)
+        try? body.write(to: tmp)
         try? FileManager.default.moveItem(at: tmp, to: requestDir.appendingPathComponent("\(id).json"))
     }
 }
