@@ -4,7 +4,7 @@
 
 Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs hide and keep running, and they come back when they need you. A small floating panel shows all agents at a glance. For Claude Code and Codex on macOS.
 
-![The panel: the most recent agent on top, all agent tabs below, a question preview on the left](docs/panel.png)
+![Top: the panel with all agent tabs, a red flame on a busy agent that is not working, old tabs folded into one line, and that agent's CPU and memory on the left. Bottom: search with a Closed section](docs/panel.png)
 
 - **Keep the tab bar short.** The tool keeps at most N agent tabs visible. It hides the others as iTerm2 **buried sessions**. They keep running.
 - **Get the tab back when it matters.** When an agent waits for you or finishes, its tab comes back to its old place, but never while you type.
@@ -124,8 +124,8 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 - A command-line flag overrides the file, for example `./run.sh start --apply --n 8`.
 - `panel.hover_ms`: the cursor must rest on the pill or bar this long (in ms) before the list opens, so a cursor that only passes over it does not open it. Default 120. `0` opens at once.
 - `panel.hotkey`: opens the list in search mode from any app, also on another desktop Space. Press it again to close. Modifiers: `ctrl`, `opt`, `cmd`, `shift`; keys: letters, digits, `space`, `return`, `tab`, `f1`–`f12` and some punctuation. `"off"` turns it off. If it does not work, another app likely uses the same keys (for example Alfred or Raycast on `opt+space`).
-- `panel.fold_idle_h`: tabs that are done or idle for more than this many hours fold into one line at the end of the list. Rest the cursor on the line, or click it, to show them. Pinned tabs, new (unseen) tabs and search results never fold. `0` turns it off.
-- `panel.fold_waiting_h`: a question left unanswered for more than this many hours also folds (an abandoned session), and no longer colors the edge bar. Default 24. `0`: waiting tabs never fold.
+- `panel.fold_idle_h`: tabs that are done or idle for more than this many hours fold into one line at the end of the list. Rest the cursor on the line, or click it, to show them. Folded tabs do not count in the pill. Pinned tabs, new (unseen) tabs and search results never fold. `0` turns it off.
+- `panel.fold_waiting_h`: a question left unanswered for more than this many hours also folds (an abandoned session), and no longer colors the edge bar or counts in the pill. Default 24. `0`: waiting tabs never fold.
 - `panel.closed_days`: the search also lists agents closed in the last N days (only real sessions, not `claude -p` or `codex exec` runs). Click one: a new tab runs `cd <folder>` and types `claude --resume <id>` (or `codex resume <id>`) without Enter. `0` turns it off.
 - `panel.dock_px`, `panel.dock_delay_ms`: how sticky the screen edge is. A dragged panel docks only when you push it at least `dock_px` past the right edge and hold for `dock_delay_ms` (the blue border then shows). A small pull back undocks it.
 - `panel.magnet_px`: a dragged panel within this distance of a screen edge snaps flush to it (also right after you pull it out of the bar). Hold ⌥ (Option) while you drag for no snap. `0` turns it off.

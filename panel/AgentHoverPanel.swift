@@ -1023,14 +1023,15 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         let inWindow = panel.convertPoint(fromScreen: NSEvent.mouseLocation)
         let inList = scroll.convert(inWindow, from: nil)
         let p = scroll.bounds.contains(inList) ? listView.convert(inWindow, from: nil) : NSPoint(x: -1, y: -1)
-        let forced = alwaysExpanded && previewForced
-            ? rowViews.first(where: { forcedPeek ? $0.row.state != "waiting" : $0.row.state == "waiting" }) : nil
+        let forced = !(alwaysExpanded && previewForced) ? nil : forcedInfo
+            ? rowViews.first(where: { $0.row.hot == true }) ?? rowViews.first
+            : rowViews.first(where: { forcedPeek ? $0.row.state != "waiting" : $0.row.state == "waiting" })
         guard expanded, panel.isVisible,
               let rv = forced ?? rowViews.first(where: { $0.frame.contains(p) })
         else { hidePreview(); return }
         // Search mode: a chat match shows the whole matched line. A waiting agent: its question.
         // Any other row: after 0.35 s on it, "peek" = the last lines of the tab's screen.
-        let onMark = forced == nil && markHitRange(rv.row, width: rv.frame.width).contains(p.x)
+        let onMark = forced != nil ? forcedInfo : markHitRange(rv.row, width: rv.frame.width).contains(p.x)
         let chatLine = searchMode ? rv.note.flatMap { $0.hasPrefix("“") ? $0 : nil } : nil
         var body = onMark ? rowInfo(rv.row) : chatLine ?? (rv.row.state == "waiting"
             ? rv.row.question ?? (rv.row.detail.flatMap { $0.isEmpty ? nil : "Waiting for you (\($0))." }
@@ -1103,8 +1104,10 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     // AGENT_HOVER_PANEL_PREVIEW=1 (with AGENT_HOVER_PANEL_EXPANDED=1): preview the first waiting row
     // without the mouse, for screenshots.
     // AGENT_HOVER_PANEL_PREVIEW=peek: peek the first row that is not waiting.
-    let previewForced = ["1", "peek"].contains(ProcessInfo.processInfo.environment["AGENT_HOVER_PANEL_PREVIEW"] ?? "")
+    // AGENT_HOVER_PANEL_PREVIEW=info: the agent facts of the first row with a flame (else the first row).
+    let previewForced = ["1", "peek", "info"].contains(ProcessInfo.processInfo.environment["AGENT_HOVER_PANEL_PREVIEW"] ?? "")
     let forcedPeek = ProcessInfo.processInfo.environment["AGENT_HOVER_PANEL_PREVIEW"] == "peek"
+    let forcedInfo = ProcessInfo.processInfo.environment["AGENT_HOVER_PANEL_PREVIEW"] == "info"
 
     func setUpSearch() {
         searchIcon.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "search")
@@ -1356,7 +1359,8 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             out.append(text("  \(state) \(age(r.last ?? r.since))", infoColor, size: 11))
             out.append(text("     ", infoColor))
         }
-        let visible = snap.rows.filter { !$0.buried }
+        // Folded (stale) rows do not count: an old unanswered question must not keep "? 1" up.
+        let visible = snap.rows.filter { !$0.buried && !isStale($0) }
         let counts: [(String, Int)] = [
             ("waiting", visible.filter { $0.state == "waiting" }.count),
             ("done", visible.filter { $0.state == "done" }.count),
@@ -1366,7 +1370,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             out.append(stateGlyph(state))
             out.append(text(" \(n)   ", mark(state).1, bold: true))
         }
-        let buried = snap.rows.filter { $0.buried }.count
+        let buried = snap.rows.filter { $0.buried && !isStale($0) }.count
         if buried > 0 { out.append(text("▾ \(buried)", infoColor, bold: true)) }
         if out.length == 0 { out.append(text("○ \(snap.rows.count) agents", infoColor)) }
         if !snap.apply { out.append(text("  dry run", dimColor, size: 10)) }
