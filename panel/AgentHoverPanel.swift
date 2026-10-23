@@ -109,6 +109,8 @@ struct Row: Decodable {
     let mem_mb: Double?    // memory of that tree, MB
     let hot: Bool?         // not working, but high CPU for minutes (daemon cpu_hot_pct / cpu_hot_min)
     let resets_at: Double? // waiting on a Codex usage limit: when it resets (Unix time)
+    let host: String?      // an agent in a tmux pane of a remote host (config.json "remote"): the host
+    let place: String?     // that pane's tmux session and window, e.g. "a:3"
 }
 
 struct Snapshot: Decodable {
@@ -407,6 +409,7 @@ func pinIcon() -> NSImage? {
 /// focus, so macOS tooltips do not show.
 func rowInfo(_ row: Row) -> String {
     var lines = ["Agent: \(row.agent)"]
+    if let h = row.host { lines.append("Host: \(h)" + (row.place.map { " (tmux \($0))" } ?? "")) }
     if let m = row.model { lines.append("Model: \(m)") }
     if let c = row.cpu { lines.append("CPU: \(Int(c.rounded()))% (with its MCP servers and commands)") }
     if let mb = row.mem_mb { lines.append("Memory: \(Int(mb)) MB") }
@@ -415,11 +418,20 @@ func rowInfo(_ row: Row) -> String {
     return lines.joined(separator: "\n")
 }
 
-/// The x range (row coordinates) of a row's agent mark, and of the flame left of it when shown.
+/// The x range (row coordinates) of a row's agent mark, and of the flame and host marks left of it
+/// when shown.
 func markHitRange(_ row: Row, width: CGFloat) -> ClosedRange<CGFloat> {
     let markX = width - pad - ageColumnW - 6 - markColumnW / 2
     let flameW = row.hot == true ? (flameIcon()?.size.width ?? 0) + 4 : 0
-    return (markX - markColumnW / 2 - flameW)...(markX + markColumnW / 2)
+    let hostW = row.host != nil ? (hostIcon()?.size.width ?? 0) + 4 : 0
+    return (markX - markColumnW / 2 - flameW - hostW)...(markX + markColumnW / 2)
+}
+
+/// The remote-host mark (SF Symbol): the agent runs in a tmux pane of another machine.
+func hostIcon() -> NSImage? {
+    NSImage(systemSymbolName: "server.rack", accessibilityDescription: "remote host")?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: fs(10), weight: .regular)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [infoColor])))
 }
 
 /// "Usage limit: resets 19:42" before the reset, "... over since 19:42" after it. A reset more
@@ -506,6 +518,12 @@ final class RowView: NSView {
             flame.draw(in: NSRect(x: x, y: (bounds.height - flame.size.height) / 2, width: flame.size.width,
                                   height: flame.size.height))
             rightW += flame.size.width + 4
+        }
+        if row.host != nil, let icon = hostIcon() {  // left of the agent mark (and of the flame)
+            let x = bounds.width - pad - rightW - icon.size.width - 2
+            icon.draw(in: NSRect(x: x, y: (bounds.height - icon.size.height) / 2, width: icon.size.width,
+                                 height: icon.size.height))
+            rightW += icon.size.width + 4
         }
         var label = row.name
         if let d = row.detail, !d.isEmpty, row.state == "waiting", row.resets_at == nil {

@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-在 **iTerm2** 裡只顯示少數幾個 AI 程式代理分頁。其他代理分頁會隱藏並繼續執行，需要你時再自己回來。一個小型浮動面板讓你一眼看到所有代理。支援 macOS 上的 Claude Code 與 Codex。
+在 **iTerm2** 裡只顯示少數幾個 AI 程式代理分頁。其他代理分頁會隱藏並繼續執行，需要你時再自己回來。一個小型浮動面板讓你一眼看到所有代理。支援 macOS 上的 Claude Code、Codex 與 Antigravity CLI（`agy`）。
 
 ![上：面板列出所有代理分頁，沒在工作卻很忙的代理有紅色火焰，舊分頁收合成一行，左邊是該代理的 CPU 與記憶體。下：搜尋與 Closed 區段](docs/panel.png)
 
@@ -16,7 +16,7 @@
 
 | 功能 | 說明 |
 |---|---|
-| 代理狀態 | Claude Code 與 Codex 的 hook 會寫入每個分頁的狀態：**工作中**、**等待中**（權限、提問、計畫）、**已完成**、**閒置** |
+| 代理狀態 | Claude Code、Codex 與 Antigravity CLI（`agy`）的 hook 會寫入每個分頁的狀態：**工作中**、**等待中**（權限、提問、計畫）、**已完成**、**閒置** |
 | N 個使用中分頁 | 背景程式會隱藏閒置或長時間工作的分頁；代理等待或完成時，再把分頁叫回來。它不會改分頁標題 |
 | 浮動面板 | 滑鼠移到膠囊上，會依最近活動順序列出所有代理分頁。點一列就會叫出該分頁 |
 | 問題預覽 | 等待中的代理有橘色 `?`。滑鼠移到該列，會顯示問題內容：要核准的指令、選項或計畫 |
@@ -28,6 +28,7 @@
 | 邊緣細條 | 把膠囊拖到螢幕右邊緣，再往外推一點並停一下（出現藍框），然後放開，它會變成一條細條，顏色代表最緊急的狀態。滑鼠移上去就會展開面板；把它拖離邊緣即可還原 |
 | 模型 | 滑鼠停在某列，會顯示代理與所用的模型（也包含自訂供應商，例如 Codex 接本機模型） |
 | 安全輸入 | 自動叫回分頁前，會等你停止打字 3 秒，避免按鍵送到錯的代理 |
+| 遠端主機 | 其他機器（SSH）上 tmux 窗格裡的代理，也會列在同一個面板，並帶伺服器標記。唯讀：主機上不安裝任何東西。見[遠端主機](#遠端主機) |
 | 設定 | `~/.agent-hover/config.json`：字型大小、面板寬度、N、閒置時間 |
 
 ## 需求
@@ -50,7 +51,7 @@
    ```sh
    ./install.sh
    ```
-3. 加入 hook。它會先備份 `~/.claude/settings.json` 與 `~/.codex/config.toml`：
+3. 加入 hook。它會先備份 `~/.claude/settings.json`、`~/.codex/config.toml`，以及（有安裝 agy 時）`~/.gemini/config/hooks.json`：
    ```sh
    ./install.sh --apply
    ```
@@ -95,7 +96,7 @@
 背景程式每秒檢查一次。
 
 - **回來：** 代理在**等你**，或已**完成**但你還沒看過。代理結束時也會回來。
-- **隱藏：** **工作中**的分頁，在你離開 120 秒後；**已完成**（看過）或**閒置**的分頁，在 20 分鐘後。
+- **隱藏：** **已完成**（看過）或**閒置**的分頁，在 20 分鐘後。**工作中**的分頁只會因下方的 N 上限而隱藏（設定 `daemon.working_park_s` 可讓它在你離開該秒數後也隱藏）。
 - **分頁太多：** 顯示的代理分頁超過 N（5）個時，先隱藏閒置的，再來是已完成的，最後是工作中的。
 - **永不隱藏：** 你正在用的分頁、每個視窗目前選取的分頁、等待中的分頁、釘選的分頁、視窗的最後一個分頁、有分割窗格的分頁。
 - **打字時不打擾：** 自動叫回分頁前，會等到 3 秒內沒有按鍵。之後，你打字的視窗會拿回鍵盤焦點。
@@ -113,9 +114,10 @@
   "panel":  {"font_size": 12, "list_width": 440, "hover_ms": 120,
              "hotkey": "ctrl+opt+space", "fold_idle_h": 12, "fold_waiting_h": 24, "closed_days": 7,
              "dock_px": 4, "dock_delay_ms": 500, "magnet_px": 24},
-  "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120,
+  "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 0,
              "cpu_hot_pct": 50, "cpu_hot_min": 2, "notify_limit_reset": true},
   "agents": {"extra": []},
+  "remote": {"hosts": []},
   "update_check": false
 }
 ```
@@ -129,12 +131,62 @@
 - `panel.closed_days`：搜尋時也列出最近 N 天關閉的代理（只算真正的對話，不含 `claude -p` 或 `codex exec`）。點一下：新分頁會執行 `cd <資料夾>`，並輸入 `claude --resume <id>`（或 `codex resume <id>`），但不按 Enter。`0` 表示關閉。
 - `panel.dock_px`、`panel.dock_delay_ms`：螢幕邊緣有多「黏」。拖曳中的面板要推過右邊緣至少 `dock_px`，並停留 `dock_delay_ms`（此時出現藍框），放開才會變成邊緣細條。稍微拉回就會變回面板。
 - `panel.magnet_px`：拖曳中的面板離螢幕邊緣在這個距離以內時，會貼齊邊緣（從邊緣細條拉出來後也一樣）。拖曳時按住 ⌥（Option）就不吸附。`0` 表示關閉。
+- `daemon.working_park_s`：你離開工作中的分頁這麼多秒後就隱藏它。預設 `0`：只有在可見的代理分頁超過 `n_active` 時，工作中的分頁才會隱藏（且最後才輪到它）。
 - `daemon.cpu_hot_pct`、`daemon.cpu_hot_min`：代理沒在工作，但 CPU 用量至少這個百分比、持續這麼多分鐘時，顯示紅色火焰。`cpu_hot_pct: 0` 表示關閉。
 - `daemon.notify_limit_reset`：Codex 分頁因用量上限而等待時，把滑鼠停在它的代理標記上，即可看到重置時間。到了重置時間，macOS 會跳出通知，告訴你代理可以繼續（Codex 不會自己繼續）；之後你第一次展開清單時，該代理標記會閃爍 30 秒，或直到你在面板上點一下。`false` 表示不通知。第一次通知時，系統可能會要求你允許 Script Editor 的通知。
 - `update_check`：設為 `true` 時每天檢查一次新版本。有新版時膠囊會顯示 **↑ update**，`./run.sh doctor` 也會提示。執行 `./run.sh update` 即可更新。預設關閉。
 - `~/.agent-hover/log/` 裡的紀錄檔超過 5 MB 會改名為 `<名稱>.1`，只保留一個舊檔。
 - `agents.extra`：要額外辨識的程式名稱（例如 `qwen`）。這類代理也需要設定 hook，以 Claude 格式的事件呼叫 `agent_hover/hook.py <名稱>`。
 - 代理標記：`~/.agent-hover/agents.json`，例如 `{"codex": {"mark": "◇", "color": "#10A37F"}}`。
+- `remote.hosts`：見[遠端主機](#遠端主機)。預設為空：不會連線。
+
+## 遠端主機
+
+在另一台機器（例如 GPU 伺服器）的 tmux 裡執行的代理，可以和本機分頁列在同一個面板。那台機器上不安裝任何東西：沒有檔案、沒有 hook、沒有背景程式，也不改設定。
+
+**設定步驟：**
+
+1. 確認 `ssh <主機>` 用金鑰即可登入，不會詢問密碼。
+2. 在 `~/.agent-hover/config.json` 加入主機：
+
+   ```json
+   "remote": {"hosts": [
+     {"name": "gpu-box", "connect": ["ssh", "gpu-box"]}
+   ]}
+   ```
+
+3. 測試：`./run.sh remote check gpu-box`，會列出找到的代理窗格。
+4. 重新啟動背景程式：`./run.sh stop && ./run.sh start --apply`。
+
+**主機設定：**
+
+| 鍵 | 意義 |
+|---|---|
+| `name` | 必填。面板上顯示的名稱 |
+| `connect` | 必填。在主機上執行 shell 指令的命令：要執行的指令會加在最後一個參數。任何連線方式都可以：`["ssh", "-p", "2222", "me@10.0.0.5"]`、`["ssh", "-J", "jump", "gpu-box"]`。沒有 `connect` 的主機會被略過 |
+| `attach` | 點一下某列時，輸入到新本機分頁的指令。會填入 `{pane}`、`{session}`、`{window}`、`{host}`。ssh 的 `connect` 預設為：`ssh -t gpu-box 'tmux attach -t {pane} \; select-window -t {pane} \; select-pane -t {pane}'` |
+| `interval_s` | 每次掃描間隔秒數。預設 5 |
+| `share_connection` | `false`：不共用 ssh 連線（見下文）。預設 `true` |
+| `enabled` | `false`：略過這台主機 |
+
+**在主機上執行什麼：** 每 `interval_s` 秒，背景程式透過 `connect` 執行一段唯讀的 shell 腳本。`./run.sh remote script` 會印出它。它只讀取：
+
+- `tmux list-panes`：窗格、所在視窗與標題。
+- `ps`：哪些窗格在執行 `claude` 或 `codex`，以及 CPU 與記憶體。每行指令只送出前兩個字。
+- `~/.claude/sessions/*.json`：Claude Code 為每個執行中 session 寫的狀態檔（busy、idle 或 waiting；資料夾；tmux 窗格）。
+- 每個執行中 Codex session 檔（`~/.codex/sessions`）的最後 64 KB，以及每分鐘一次各代理對話紀錄中的模型名稱。
+
+懸停預覽執行 `tmux capture-pane -p`。只有點擊會改變東西：開一個執行 `attach` 的本機分頁；或在之前開過的分頁裡，選取該列的 tmux 視窗與窗格（`tmux select-window`、`select-pane`）。背景程式的紀錄（`./run.sh log`）會記下啟動時的腳本，以及每次 peek 與 select 指令。
+
+**共用一條連線：** 對 ssh 的 `connect`，背景程式會加上 `BatchMode=yes`（不詢問密碼）、`ConnectTimeout=5`、`Compression=yes` 與共用連線（`ControlMaster=auto`、`ControlPersist=120`，控制 socket 放在 `~/.agent-hover/`）。只有你的指令沒設定該選項時才會加。第一次掃描登入一次；之後的掃描都重用這條連線（約 0.1 秒，而不是 1–2 秒）。這是 OpenSSH 用戶端的功能，伺服器不需要任何改動。Windows 的 OpenSSH 不支援：請設 `"share_connection": false`。
+
+**和本機分頁（hook）相比的限制：**
+
+- 狀態變化最多晚 `interval_s` 秒才顯示。
+- Claude：busy、idle、waiting 來自 Claude 的狀態檔。Claude 不會寫「完成」：背景程式看到代理從工作中變成閒置時，會顯示為**完成**，直到你看過它。比一次掃描還短的回合可能漏掉。因用量上限或登入問題而停止時，會顯示為閒置，列上也沒有問題文字（預覽會顯示畫面）。
+- Codex：工作中、完成、錯誤、中斷與用量上限（含重設時間）來自 session 檔的結尾。Codex 等待核准時可能顯示為工作中（未驗證）。
+- 只顯示 tmux 窗格裡的代理。Codex 的 session 檔透過 `/proc`（Linux）或 `lsof` 找到。
+- 遠端列不會被隱藏或移動：本機沒有可以隱藏的分頁。
 
 ## 指令
 
@@ -152,10 +204,12 @@
 | `./run.sh log` | 持續顯示決策記錄 |
 | `./run.sh panel` / `panel-stop` | 啟動／停止面板 |
 | `./run.sh search [--chat] [--closed] 關鍵字` | 依名稱、資料夾、對話內容找代理分頁；`--closed` 會加上最近關閉的代理與恢復指令 |
+| `./run.sh remote script` / `remote check 名稱` | 印出遠端主機用的唯讀腳本／在主機上掃描一次並列出代理窗格 |
 
 ## 會改什麼，以及如何復原
 
-- **Hook：** 在 `~/.claude/settings.json` 加入有標記的項目，在 `~/.codex/config.toml` 加入有標記的區塊。這兩個檔案的其他內容不會變。安裝前會先備份到 `~/.agent-hover/backup/<時間>/`。
+- **Hook：** 在 `~/.claude/settings.json` 加入有標記的項目，在 `~/.codex/config.toml` 加入有標記的區塊，在 `~/.gemini/config/hooks.json` 加入 `agent-hover` 項目（有安裝 agy 且檔案不存在時會建立；還原時會再刪除）。這些檔案的其他內容不會變。安裝前會先備份到 `~/.agent-hover/backup/<時間>/`。
+- **agy：** Antigravity 的 agy CLI、Antigravity IDE 與 app 都讀 `~/.gemini/config/hooks.json`。在 IDE 與 app 裡，hook 找不到 iTerm2 分頁，因此不做任何事。它對 PreToolUse 一律回答 `allow`，所以仍由 agy 自己的權限規則決定。
 - **資料：** `~/.agent-hover/` 存放狀態檔、記錄、釘選與備份。只有你的使用者帳號能讀取。
 - **自動啟動（只有你開啟時）：** `~/Library/LaunchAgents/local.agent-hover.plist`。
 - **iTerm2：** 它會隱藏與叫回代理分頁，並把叫回的分頁移回原位。iTerm2 內建的 Claude Code 整合不會被更動。
@@ -173,7 +227,10 @@
 
 ## 隱私
 
-所有資料都留在你的 Mac 上，不會連網；唯一例外是你開啟的更新檢查（`"update_check": true`）：每天一次用 `git ls-remote` 向 GitHub 查詢最新的 commit ID。它只顯示標記，不會下載或安裝。
+所有資料都留在你的 Mac 上，不會連網；例外只有：
+
+- 你開啟的更新檢查（`"update_check": true`）：每天一次用 `git ls-remote` 向 GitHub 查詢最新的 commit ID。它只顯示標記，不會下載或安裝。
+- 你加入的遠端主機（`"remote"`）：透過你自己的 `connect` 指令做唯讀掃描（見[遠端主機](#遠端主機)）。結果只留在記憶體與 `~/.agent-hover/panel.json`。
 
 - hook 會儲存每個代理的狀態、資料夾，以及待回覆問題的文字。
 - 對話搜尋與小框中的模型名稱會讀取代理自己的對話紀錄檔（`~/.claude/projects`、`~/.codex/sessions`），只在你搜尋時，或針對目前開著的分頁讀取。
@@ -210,8 +267,9 @@ Claude Code / Codex hooks ──► ~/.agent-hover/state/<分頁>.json
 ## 限制
 
 - 只支援 macOS 與 iTerm2。只有 iTerm2 能隱藏分頁並讓它繼續執行。
-- 預設只支援 Claude Code 與 Codex。
-- 不追蹤遠端代理（SSH + tmux）。
+- 預設只支援 Claude Code、Codex 與 agy。
+- agy 沒有「詢問權限」的 hook 事件。背景程式每 2 秒讀取每個工作中 agy 分頁的對話資料庫（`~/.gemini/antigravity-cli/conversations/<id>.db`，唯讀）：若有步驟標記為等待，該列會顯示為**等待中**，並以指令作為問題。這依賴 agy 的內部格式，日後可能改變。`agy -p` 的執行（例如另一個代理在它的分頁裡啟動的審查）會被忽略。
+- 遠端代理只在 tmux 裡執行、且主機列在 `remote.hosts` 時才顯示。它們的狀態用輪詢取得，不如 hook 精確（見[遠端主機](#遠端主機)）。
 - 有分割窗格的分頁會列出，但不會被隱藏或移動。
 - 面板與背景程式依賴 iTerm2 與 macOS 的行為，未來版本可能改變。例如空間檢查使用 macOS 私有呼叫；若失敗，面板就會在每個空間顯示。
 

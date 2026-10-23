@@ -123,3 +123,11 @@ def test_selected_done_tab_is_not_seen_while_app_inactive():
     t = tab("x", DONE, age=10, last_focus_ts=NOW - 300, selected=True)
     from agent_hover.rules import seen
     assert not seen(t)
+
+
+def test_default_working_tab_parks_only_over_n():
+    cfg = Config(n_active=2, idle_park_s=600, settle_s=3)  # working_park_s 0: no timer
+    busy = [tab(s, WORKING, age=5000, last_focus_ts=NOW - 5000) for s in ("a", "b")]
+    assert decide(busy, NOW, cfg, NOW - 60, {"w1": 99}).bury == []
+    d = decide(busy + [tab("c", WORKING, age=5000, last_focus_ts=NOW - 100)], NOW, cfg, NOW - 60, {"w1": 99})
+    assert d.bury == ["a"] and d.reasons["a"] == "park: over 2 active (working)"

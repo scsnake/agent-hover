@@ -13,6 +13,7 @@
 #   ./run.sh panel-stop  stop the hover panel
 #   ./run.sh search [--chat] [--closed] WORD   find agent tabs by name, folder (and chat text)
 #   ./run.sh update      git pull --ff-only, uv sync, restart what was running
+#   ./run.sh remote script|check NAME   remote tmux hosts: the read-only script, or one test scan
 set -euo pipefail
 cd "$(dirname "$0")"
 HOME_DIR="${AGENT_HOVER_HOME:-$HOME/.agent-hover}"
@@ -148,6 +149,10 @@ case "${1:-up}" in
     shift
     .venv/bin/python -m agent_hover.search "$@"
     ;;
+  remote)
+    shift
+    .venv/bin/python -m agent_hover.remote "$@"
+    ;;
   doctor)
     BAD=0
     ok() { echo "  ✓ $1"; }
@@ -248,5 +253,5 @@ PY
       sleep 10
     done
     ;;
-  *) sed -n '2,14p' "$0"; exit 2 ;;
+  *) sed -n '2,15p' "$0"; exit 2 ;;
 esac

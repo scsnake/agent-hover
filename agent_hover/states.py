@@ -28,10 +28,39 @@ CLAUDE_ACCOUNT_ERRORS = {"authentication_failed", "oauth_org_not_allowed", "acco
 CLAUDE_DIALOG_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
 
+# Antigravity CLI (agy) hooks (~/.gemini/config/hooks.json): the payload has no event name, so
+# the hook command gets it as an argument. PreToolUse and Stop must answer with a decision:
+# "allow" hands the tool call on to agy's own permission rules; any Stop decision but
+# "continue" lets the turn end.
+AGY_EVENTS = ["SessionStart", "PreInvocation", "PreToolUse", "PostToolUse", "PostInvocation", "Stop"]
+AGY_REPLY = {"PreToolUse": {"decision": "allow"}, "Stop": {"decision": "stop"}}
+
+
+def agy_payload(event, raw):
+    """An agy hook payload in the Claude-style names that map_event and the hook use."""
+    raw = raw if isinstance(raw, dict) else {}
+    paths = raw.get("workspacePaths") if isinstance(raw.get("workspacePaths"), list) else []
+    call = raw.get("toolCall") if isinstance(raw.get("toolCall"), dict) else {}
+    return {"hook_event_name": event, "session_id": raw.get("conversationId"),
+            "cwd": paths[0] if paths and isinstance(paths[0], str) else None,
+            "tool_name": call.get("name", ""), "transcript_path": raw.get("transcriptPath"),
+            "model": raw.get("modelName"), "termination": raw.get("terminationReason", ""),
+            "error": raw.get("error") or ""}
+
+
 def map_event(agent, payload):
     """Return (state, detail) for one hook event, or None to keep the old state."""
     event = payload.get("hook_event_name", "")
     tool = payload.get("tool_name", "")
+    if agent == "agy":
+        if event == "PreInvocation":
+            return WORKING, "thinking"
+        if event == "PostInvocation":
+            return None
+        if event == "Stop":
+            reason = payload.get("termination", "")
+            return DONE, ("error" if reason == "error" or payload.get("error")
+                          else "max steps" if reason == "max_steps_exceeded" else "")
     if event == "SessionStart":
         if payload.get("source") == "compact":
             return None  # compaction can happen inside a running turn: keep the state
@@ -143,11 +172,13 @@ def codex_rollout(session_id):
 CODEX_TURN_TYPES = ("task_started", "task_complete", "turn_aborted")
 
 
-def codex_last_turn(path, tail_bytes=262144):
+def codex_last_turn(path, tail_bytes=262144, text=None):
     """The last turn record of the main agent in a Codex session file (task_started,
     task_complete or turn_aborted payload), or None. Codex sends no Stop hook when a turn ends
-    with an error (for example usage_limit_exceeded), so the file is the only sign."""
-    for line in reversed(_file_part(path, tail_bytes, tail=True).splitlines()):
+    with an error (for example usage_limit_exceeded), so the file is the only sign.
+    text: the end of the file, already read (a remote host); path is then not used."""
+    tail = text if text is not None else _file_part(path, tail_bytes, tail=True)
+    for line in reversed(tail.splitlines()):
         if '"event_msg"' not in line or not any(f'"{t}"' in line for t in CODEX_TURN_TYPES):
             continue
         try:
@@ -178,11 +209,12 @@ def codex_turn_state(payload):
     return DONE, "error", None
 
 
-def codex_resets_at(path, tail_bytes=262144):
+def codex_resets_at(path, tail_bytes=262144, text=None):
     """When a Codex usage limit resets (Unix time), from the last rate_limits record that has
     limit windows: the latest reset among the windows at 95 % or more (both full: the later one),
-    else the fullest window's reset. None if not found."""
-    for line in reversed(_file_part(path, tail_bytes, tail=True).splitlines()):
+    else the fullest window's reset. None if not found. text: as in codex_last_turn."""
+    tail = text if text is not None else _file_part(path, tail_bytes, tail=True)
+    for line in reversed(tail.splitlines()):
         if '"rate_limits"' not in line:
             continue
         try:
@@ -229,6 +261,37 @@ def nested_run(agent, payload, env=None):
     if agent == "codex":
         head = _file_part(transcript or codex_rollout(payload.get("session_id")), 8192, tail=False)
         return bool(CODEX_EXEC_RE.search(head))
+    if agent == "agy":
+        # `agy -p` (print mode), for example a review run by another agent in its tab.
+        return bool(env.get("AGY_REVIEW_ACTIVE")) or agy_print_mode()
+    return False
+
+
+AGY_PRINT_FLAGS = {"-p", "--print", "--prompt"}
+
+
+def agy_print_mode(pid=None):
+    """True if the nearest agy process above this hook runs in print mode (-p)."""
+    import subprocess
+    pid = os.getppid() if pid is None else pid
+    for _ in range(6):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,args=", "-p", str(pid)], capture_output=True,
+                                 text=True, timeout=2).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if not out:
+            return False
+        ppid, _, args = out.partition(" ")
+        words = args.split()
+        if words and words[0].rsplit("/", 1)[-1] == "agy":
+            return any(w in AGY_PRINT_FLAGS or w.startswith(("--print=", "--prompt=")) for w in words[1:])
+        try:
+            pid = int(ppid)
+        except ValueError:
+            return False
+        if pid <= 1:
+            return False
     return False
 
 

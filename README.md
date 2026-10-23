@@ -2,7 +2,7 @@
 
 [繁體中文說明](README.zh-TW.md)
 
-Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs hide and keep running, and they come back when they need you. A small floating panel shows all agents at a glance. For Claude Code and Codex on macOS.
+Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs hide and keep running, and they come back when they need you. A small floating panel shows all agents at a glance. For Claude Code, Codex and the Antigravity CLI (`agy`) on macOS.
 
 ![Top: the panel with all agent tabs, a red flame on a busy agent that is not working, old tabs folded into one line, and that agent's CPU and memory on the left. Bottom: search with a Closed section](docs/panel.png)
 
@@ -16,7 +16,7 @@ Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs
 
 | Feature | How |
 |---|---|
-| Agent status | Claude Code and Codex hooks write each tab's state: **working**, **waiting** (permission, question, plan), **done**, **idle** |
+| Agent status | Claude Code, Codex and Antigravity CLI (`agy`) hooks write each tab's state: **working**, **waiting** (permission, question, plan), **done**, **idle** |
 | N active tabs | A daemon buries idle and long-working tabs, and unburies a tab when its agent waits or is done. It never changes tab titles |
 | Floating panel | Hover the pill to see all agent tabs, most recent first. Click a row to raise that tab |
 | Question preview | A waiting agent has an orange `?`. Hover its row to see the question: the command to approve, the choices, or the plan |
@@ -28,6 +28,7 @@ Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs
 | Edge bar | Drag the pill against the right edge of the screen, push a little past it and hold for a moment (a blue border appears), then release. It becomes a thin bar in the color of the most urgent state. Hover it to see the panel; drag it away from the edge to undock |
 | Model | Hover a row to see the agent and its model (also a custom provider, for example Codex with a local model) |
 | Safe typing | An automatic unbury waits until you stop typing for 3 s, so your keys never go to the wrong agent |
+| Remote hosts | Agents in tmux panes on other machines (SSH) show in the same panel, with a server mark. Read-only: nothing is installed on the host. See [Remote hosts](#remote-hosts-tmux-over-ssh) |
 | Settings | `~/.agent-hover/config.json`: font size, panel width, N, idle time |
 
 ## Requirements
@@ -50,7 +51,7 @@ Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs
    ```sh
    ./install.sh
    ```
-3. Add the hooks. This first backs up `~/.claude/settings.json` and `~/.codex/config.toml`:
+3. Add the hooks. This first backs up `~/.claude/settings.json`, `~/.codex/config.toml` and (if agy is installed) `~/.gemini/config/hooks.json`:
    ```sh
    ./install.sh --apply
    ```
@@ -95,7 +96,7 @@ The same search works in a terminal: `./run.sh search [--chat] [--closed] WORD`.
 The daemon checks once per second.
 
 - **Comes back:** the agent **waits** for you, or is **done** and you did not look at it yet. Also when its agent ends.
-- **Hidden:** a **working** tab 120 s after you leave it; a **done** (seen) or **idle** tab after 20 min.
+- **Hidden:** a **done** (seen) or **idle** tab after 20 min. A **working** tab is hidden only by the N limit below (set `daemon.working_park_s` to also hide it that many seconds after you leave it).
 - **Too many tabs:** when more than N (5) agent tabs are visible, idle tabs go first, then done, then working.
 - **Never hidden:** the tab you use, the selected tab of each window, waiting tabs, pinned tabs, the last tab of a window, tabs with split panes.
 - **No surprises while you type:** an automatic unbury waits until no key was pressed for 3 s. Afterwards, the window you typed in gets the keyboard back.
@@ -113,9 +114,10 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
   "panel":  {"font_size": 12, "list_width": 440, "hover_ms": 120,
              "hotkey": "ctrl+opt+space", "fold_idle_h": 12, "fold_waiting_h": 24, "closed_days": 7,
              "dock_px": 4, "dock_delay_ms": 500, "magnet_px": 24},
-  "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 120,
+  "daemon": {"n_active": 5, "idle_min": 20, "working_park_s": 0,
              "cpu_hot_pct": 50, "cpu_hot_min": 2, "notify_limit_reset": true},
   "agents": {"extra": []},
+  "remote": {"hosts": []},
   "update_check": false
 }
 ```
@@ -129,12 +131,62 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 - `panel.closed_days`: the search also lists agents closed in the last N days (only real sessions, not `claude -p` or `codex exec` runs). Click one: a new tab runs `cd <folder>` and types `claude --resume <id>` (or `codex resume <id>`) without Enter. `0` turns it off.
 - `panel.dock_px`, `panel.dock_delay_ms`: how sticky the screen edge is. A dragged panel docks only when you push it at least `dock_px` past the right edge and hold for `dock_delay_ms` (the blue border then shows). A small pull back undocks it.
 - `panel.magnet_px`: a dragged panel within this distance of a screen edge snaps flush to it (also right after you pull it out of the bar). Hold ⌥ (Option) while you drag for no snap. `0` turns it off.
+- `daemon.working_park_s`: hide a working tab this many seconds after you leave it. Default `0`: a working tab is hidden only when more than `n_active` agent tabs are visible (working tabs go last).
 - `daemon.cpu_hot_pct`, `daemon.cpu_hot_min`: the red flame shows when an agent that is not working uses at least this % CPU for this many minutes. `cpu_hot_pct: 0` turns it off.
 - `daemon.notify_limit_reset`: when a Codex tab waits on a usage limit, hover its agent mark to see when the limit resets. At the reset time, a macOS notification says the agent can continue (Codex does not go on by itself), and the agent mark blinks the first time you open the list after it (for 30 s, or until you click the panel). `false` turns the notification off. The first notification may ask you to allow notifications for Script Editor.
 - `update_check`: `true` checks once a day for a newer version. The pill then shows **↑ update**, and `./run.sh doctor` says so. Run `./run.sh update` to get it. Off by default.
 - Logs in `~/.agent-hover/log/` move to `<name>.1` at 5 MB; one old file is kept.
 - `agents.extra`: more job names to find (for example `qwen`). Such an agent also needs hooks that call `agent_hover/hook.py <name>` with Claude-style events.
 - Agent marks: `~/.agent-hover/agents.json`, for example `{"codex": {"mark": "◇", "color": "#10A37F"}}`.
+- `remote.hosts`: see [Remote hosts](#remote-hosts-tmux-over-ssh). Empty by default: nothing connects.
+
+## Remote hosts (tmux over SSH)
+
+Agents that run in tmux on another machine (for example a GPU server) can show in the panel next to your local tabs. Nothing is installed on that machine: no files, no hooks, no background process, no settings change.
+
+**Set up:**
+
+1. Make sure that `ssh <host>` works with a key, without a password prompt.
+2. Add the host to `~/.agent-hover/config.json`:
+
+   ```json
+   "remote": {"hosts": [
+     {"name": "gpu-box", "connect": ["ssh", "gpu-box"]}
+   ]}
+   ```
+
+3. Test it: `./run.sh remote check gpu-box`. It lists the agent panes it finds.
+4. Restart the daemon: `./run.sh stop && ./run.sh start --apply`.
+
+**Host settings:**
+
+| Key | Meaning |
+|---|---|
+| `name` | Needed. The name in the panel |
+| `connect` | Needed. The command that runs a shell command on the host: the command is added as its last argument. Any transport works: `["ssh", "-p", "2222", "me@10.0.0.5"]`, `["ssh", "-J", "jump", "gpu-box"]`. Without `connect`, the host is skipped |
+| `attach` | The command typed into a new local tab when you click a row. `{pane}`, `{session}`, `{window}` and `{host}` are filled in. Default for an ssh `connect`: `ssh -t gpu-box 'tmux attach -t {pane} \; select-window -t {pane} \; select-pane -t {pane}'` |
+| `interval_s` | Seconds between scans. Default 5 |
+| `share_connection` | `false`: do not share one ssh connection (see below). Default `true` |
+| `enabled` | `false`: skip this host |
+
+**What runs on the host:** every `interval_s` seconds, the daemon runs one read-only shell script through `connect`. `./run.sh remote script` prints it. It only reads:
+
+- `tmux list-panes`: the panes, their windows and titles.
+- `ps`: which panes run `claude` or `codex`, and their CPU and memory. Only the first two words of each command line are sent.
+- `~/.claude/sessions/*.json`: Claude Code's own status file of each running session (busy, idle or waiting; folder; tmux pane).
+- The last 64 KB of each running Codex session file (`~/.codex/sessions`), and once a minute the model line of each agent's transcript.
+
+Hover Peek runs `tmux capture-pane -p`. Only a click changes something: it opens a local tab that runs `attach`, or, in the tab it opened before, selects the row's tmux window and pane (`tmux select-window`, `select-pane`). The daemon log (`./run.sh log`) records the script at start, and each peek and select command.
+
+**One shared connection:** to an ssh `connect`, the daemon adds `BatchMode=yes` (no password prompt), `ConnectTimeout=5`, `Compression=yes` and a shared connection (`ControlMaster=auto`, `ControlPersist=120`, control socket in `~/.agent-hover/`). It adds each option only when your command does not set it. The first scan logs in once; each later scan reuses that connection (about 0.1 s instead of 1–2 s). This is a feature of the OpenSSH client and needs no change on the server. Windows OpenSSH does not support it: use `"share_connection": false` there.
+
+**Limits compared with local tabs (hooks):**
+
+- A state change shows after up to `interval_s` seconds, not at once.
+- Claude: busy, idle and waiting come from Claude's status file. Claude does not write "done": an agent that goes from working to idle while the daemon watches shows as **done** until you look at it. A turn shorter than one scan can be missed. A usage-limit or sign-in stop shows as idle, and the row has no question text (Peek shows the screen).
+- Codex: working, done, error, interrupted and the usage limit (with its reset time) come from the end of its session file. A Codex approval wait may show as working (not verified).
+- Only agents in tmux panes show. A Codex session file is found through `/proc` (Linux) or `lsof`.
+- Remote rows are not hidden or moved: there is no local tab to bury.
 
 ## Commands
 
@@ -152,10 +204,12 @@ Copy `config.example.json` to `~/.agent-hover/config.json` and change what you n
 | `./run.sh log` | Follow the decision log |
 | `./run.sh panel` / `panel-stop` | Start / stop the panel |
 | `./run.sh search [--chat] [--closed] WORD` | Find agent tabs by name, folder, chat text; `--closed` adds recently closed agents with their resume command |
+| `./run.sh remote script` / `remote check NAME` | Print the read-only script for remote hosts / run one scan on a host and list its agent panes |
 
 ## What it changes, and how to undo it
 
-- **Hooks:** tagged entries in `~/.claude/settings.json` and a marked block in `~/.codex/config.toml`. Nothing else in these files changes. The install backs up both files first, to `~/.agent-hover/backup/<time>/`.
+- **Hooks:** tagged entries in `~/.claude/settings.json`, a marked block in `~/.codex/config.toml`, and an `agent-hover` entry in `~/.gemini/config/hooks.json` (made if agy is installed and the file is missing; restore removes it again). Nothing else in these files changes. The install backs up the files first, to `~/.agent-hover/backup/<time>/`.
+- **agy:** Antigravity reads `~/.gemini/config/hooks.json` in the agy CLI, the Antigravity IDE and the app. In the IDE and the app the hook finds no iTerm2 tab and does nothing. It always answers `allow` to PreToolUse, so agy's own permission rules still decide.
 - **Data:** `~/.agent-hover/` holds state files, logs, pins and backups. Only your user can read it.
 - **Autostart (only if you turn it on):** `~/Library/LaunchAgents/local.agent-hover.plist`.
 - **iTerm2:** it buries and unburies agent tabs, and moves an unburied tab back to its old place. iTerm2's own Claude Code integration is not changed.
@@ -173,7 +227,10 @@ To undo:
 
 ## Privacy
 
-Everything stays on your Mac. There are no network calls, except the update check if you turn it on (`"update_check": true`): once a day, `git ls-remote` asks GitHub for the newest commit ID. It only shows a mark; it never downloads or installs.
+Everything stays on your Mac. There are no network calls, except:
+
+- the update check if you turn it on (`"update_check": true`): once a day, `git ls-remote` asks GitHub for the newest commit ID. It only shows a mark; it never downloads or installs.
+- the remote hosts that you add (`"remote"`): the read-only scan through your own `connect` command (see [Remote hosts](#remote-hosts-tmux-over-ssh)). Its result stays in memory and in `~/.agent-hover/panel.json`.
 
 - The hooks store each agent's state, its folder, and the text of a pending question.
 - The chat search and the model name in the hover frame read the agents' own transcript files (`~/.claude/projects`, `~/.codex/sessions`), only when you search or for the open tabs.
@@ -210,8 +267,9 @@ Tests: `uv run pytest`. The end-to-end test `tests/e2e_sandbox.py` opens a test 
 ## Limits
 
 - macOS and iTerm2 only. Only iTerm2 can hide a tab and keep it running.
-- Claude Code and Codex only, out of the box.
-- Remote agents (SSH + tmux) are not tracked.
+- Claude Code, Codex and agy only, out of the box.
+- agy has no hook event for a permission prompt. Every 2 s the daemon reads each working agy tab's conversation database (`~/.gemini/antigravity-cli/conversations/<id>.db`, read-only): a step marked waiting shows the row as **waiting**, with the command as the question. This uses agy's internal format, which may change. `agy -p` runs (for example a review that another agent starts in its tab) are ignored.
+- Remote agents show only when they run in tmux, and only from the hosts in `remote.hosts`. Their state is polled, so it is less exact than with hooks (see [Remote hosts](#remote-hosts-tmux-over-ssh)).
 - Split-pane tabs are listed, but not hidden or moved.
 - The panel and the daemon use iTerm2 and macOS behavior that may change in later versions. For example, the Space check uses a private macOS call; if it fails, the panel simply shows on every Space.
 

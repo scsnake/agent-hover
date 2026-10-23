@@ -1,12 +1,12 @@
 import json
 
-from agent_hover import daemon
+from agent_hover import agents, daemon
 
 SID = "9ff5d09d-0bd1-475d-8291-6345e387acec"
 
 
 def test_claude_session_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(daemon, "CLAUDE_SESSIONS", tmp_path)
+    monkeypatch.setattr(agents, "CLAUDE_SESSIONS", tmp_path)
     (tmp_path / "123.json").write_text(json.dumps({"pid": 123, "sessionId": SID}))
     (tmp_path / "456.json").write_text(json.dumps({"pid": 999, "sessionId": SID}))  # stale: other process
     assert daemon.claude_session(123)["sessionId"] == SID

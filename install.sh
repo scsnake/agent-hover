@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Add the agent-hover hooks to Claude Code and Codex. Dry run unless --apply.
+# Add the agent-hover hooks to Claude Code, Codex and agy (Antigravity CLI). Dry run unless --apply.
 #   ./install.sh            show the planned change, write nothing
 #   ./install.sh --apply    back up both files, then add the hooks
 set -euo pipefail

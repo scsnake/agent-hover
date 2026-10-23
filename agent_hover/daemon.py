@@ -21,7 +21,11 @@ from pathlib import Path
 
 import iterm2
 
-from agent_hover import search, states
+from agent_hover import agents, remote, search, states
+from agent_hover.agents import (CLAUDE_SESSIONS, CLAUDE_STATUS, CODEX_PIDS, as_pid, child_map,  # noqa: F401
+                               claude_session, clean_name, codex_main_rollout, codex_turn_update,
+                               agy_conversation, detect_agent, process_table, seed_record, title_state,
+                               tree_usage, with_agy_session, with_claude_session, with_codex_session)
 from agent_hover.rules import Config, Tab, decide
 
 TICK_S = 1.0
@@ -29,6 +33,7 @@ NAME_REFRESH_S = 5.0
 MODEL_REFRESH_S = 30.0  # read each tab's model from its transcript this often
 USAGE_SCAN_S = 5.0  # CPU and memory of each agent's process tree, this often
 CODEX_SCAN_S = 5.0  # read the end of each working Codex tab's session file this often
+AGY_SCAN_S = 2.0  # look for a permission prompt in each working agy tab's conversation this often
 UPDATE_FILE = states.HOME / "update.json"
 UPDATE_EVERY_S = 86400.0  # the opt-in update check ("update_check": true in config.json), once a day
 REPO = Path(__file__).resolve().parent.parent
@@ -39,79 +44,8 @@ PANEL_FILE = states.HOME / "panel.json"
 PEEK_FILE = states.HOME / "peek.json"  # last screen lines of one tab, for the panel's hover preview
 PINS_FILE = states.HOME / "pins.json"  # tabs pinned in the panel: never parked
 GROUP_ORDER = {states.WAITING: 0, states.DONE: 1, states.WORKING: 2, states.IDLE: 3}
-
-
-def clean_name(name):
-    """'✳ Docs site' -> 'Docs site': drop the status glyph or spinner that agents put first."""
-    return re.sub(r"^[^\w(\[]+", "", name or "").strip()
-
-
-AGENTS = ["claude", "codex"]  # plus config.json "agents": {"extra": [...]}
 SEED_SCAN_S = 5.0
 ENDED_GRACE_S = 10.0  # an agent that wrote SessionEnd may still be the tab's job for a moment
-# Claude Code keeps one file per running process: {"pid", "sessionId", "cwd", "status", ...}.
-CLAUDE_SESSIONS = Path.home() / ".claude" / "sessions"
-CLAUDE_STATUS = {"busy": states.WORKING, "idle": states.IDLE, "waiting": states.WAITING}
-
-
-def detect_agent(process_title, command_line):
-    """'claude' or 'codex' if the tab's foreground job is that agent, else None.
-
-    iTerm2's jobName is Claude's version (for example 2.1.305), so use processTitle and the
-    first two words of commandLine (the second covers 'node .../codex')."""
-    names = [process_title or ""] + [w.rsplit("/", 1)[-1] for w in (command_line or "").split()[:2]]
-    return next((a for a in AGENTS if a in names), None)
-
-
-def title_state(auto_name):
-    """Claude's title glyph: '✳' = idle, another leading glyph (a spinner) = working."""
-    m = re.match(r"^[^\w(\[]+", auto_name or "")
-    glyph = m.group(0).strip() if m else ""
-    if not glyph or glyph.startswith("✳"):
-        return states.IDLE
-    return states.WORKING
-
-
-def seed_record(sid, agent, auto_name, path, now):
-    """State for an agent tab that has sent no hook event since the install."""
-    return {"iterm": sid, "agent": agent, "state": title_state(auto_name), "detail": "seen by daemon",
-            "event": "seed", "ts": now, "agent_session": None, "cwd": path}
-
-
-def claude_session(pid):
-    """Claude Code's own file for a running process, or None."""
-    try:
-        pid = int(pid)
-        data = json.loads((CLAUDE_SESSIONS / f"{pid}.json").read_text())
-    except (OSError, ValueError, TypeError):
-        return None
-    return data if isinstance(data, dict) and data.get("pid") == pid else None
-
-
-CODEX_PIDS = {}  # Codex process ID -> its main session file, found once with lsof
-
-
-def codex_main_rollout(pid):
-    """The session file of a running Codex process's main thread (it keeps its session files
-    open; sub-agent threads have their own, marked "thread_source":"subagent"), or None."""
-    if pid in CODEX_PIDS:
-        return CODEX_PIDS[pid]
-    found = None
-    try:
-        out = subprocess.run(["lsof", "-p", str(int(pid)), "-Fn"], capture_output=True, text=True,
-                             timeout=5).stdout
-    except (OSError, ValueError, subprocess.SubprocessError):
-        out = ""
-    for line in out.splitlines():
-        path = line[1:]
-        if line.startswith("n") and "/.codex/sessions/" in path and Path(path).name.startswith("rollout-"):
-            head = states._file_part(path, 8192, tail=False)
-            if re.search(r'"thread_source":\s*"user"', head) and not states.CODEX_EXEC_RE.search(head):
-                found = path
-                break
-    if found:  # none yet (a new Codex may not have written its file): look again next scan
-        CODEX_PIDS[pid] = found
-    return found
 
 
 def notify(title, text):
@@ -123,53 +57,6 @@ def notify(title, text):
                          stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         pass
-
-
-def with_codex_session(rec, path):
-    """A seeded Codex record with the session ID, folder and state from its session file."""
-    if not path:
-        return rec
-    new = dict(rec)
-    sid = Path(path).stem[-36:]
-    if states.UUID_RE.fullmatch(sid):
-        new["agent_session"] = sid
-    m = re.search(r'"cwd":\s*"((?:[^"\\]|\\.)*)"', states._file_part(path, 8192, tail=False))
-    if m:
-        new["cwd"] = json.loads(f'"{m.group(1)}"')
-    turn = states.codex_last_turn(path)
-    found = states.codex_seed_state(turn)
-    if found and found[0] != rec.get("state"):
-        state, detail, question = found
-        when = turn.get("completed_at") or turn.get("started_at")
-        new.update(state=state, detail=detail, ts=float(when) if isinstance(when, (int, float)) else time.time())
-        if question:
-            new["question"] = question
-    if new.get("detail") == "usage limit" and new.get("state") == states.WAITING and not new.get("resets_at"):
-        new["resets_at"] = states.codex_resets_at(path)
-    if new.get("detail") == "seen by daemon":
-        new["detail"] = ""
-    return new
-
-
-def with_claude_session(rec, info, now):
-    """A seeded record with the session ID, folder and state from Claude's own file (a tab with
-    no hook event yet: Claude started before the install, or its hooks do not reach us)."""
-    if not info:
-        return rec
-    new = dict(rec)
-    sid = info.get("sessionId")
-    if isinstance(sid, str) and states.UUID_RE.fullmatch(sid):
-        new["agent_session"] = sid
-    if isinstance(info.get("cwd"), str) and info["cwd"]:
-        new["cwd"] = info["cwd"]
-    state = CLAUDE_STATUS.get(info.get("status"))
-    if state and state != rec.get("state"):
-        new["state"] = state
-        changed = info.get("statusUpdatedAt")
-        new["ts"] = changed / 1000 if isinstance(changed, (int, float)) else now
-    if new.get("detail") in ("seen by daemon", "Claude session file"):
-        new["detail"] = ""  # internal notes, not for the panel (it shows a waiting row's detail)
-    return new
 
 
 async def seed_agents(app, known, checked):
@@ -217,9 +104,10 @@ async def seed_agents(app, known, checked):
                             checked[sid] = pid
                             continue
                     checked[sid] = pid
-                    if rec.get("agent") in ("claude", "codex"):
+                    if rec.get("agent") in ("claude", "codex", "agy"):
                         new = (with_claude_session(rec, claude_session(pid), now) if rec["agent"] == "claude"
-                               else with_codex_session(rec, codex_main_rollout(pid)))
+                               else with_codex_session(rec, codex_main_rollout(pid)) if rec["agent"] == "codex"
+                               else with_agy_session(rec, agy_conversation(pid)))
                         latest = states.read_state(sid) or {}
                         if new != rec and latest.get("event") == "seed":  # a hook may have just written
                             states.write_state(sid, new)
@@ -240,60 +128,11 @@ async def seed_agents(app, known, checked):
                         rec = with_claude_session(rec, claude_session(pid), now)
                     elif agent == "codex":
                         rec = with_codex_session(rec, codex_main_rollout(pid))
+                    elif agent == "agy":
+                        rec = with_agy_session({**rec, "state": states.IDLE}, agy_conversation(pid))
                     states.write_state(sid, rec)
                     log("seed", session=sid, agent=agent, state=rec["state"],
                         agent_session=rec.get("agent_session"))
-
-
-def process_table():
-    """pid -> (parent pid, % CPU, resident memory in KB) for all processes (one `ps` call)."""
-    try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pcpu=,rss="], capture_output=True,
-                             text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    table = {}
-    for line in out.splitlines():
-        parts = line.split()
-        try:
-            table[int(parts[0])] = (int(parts[1]), float(parts[2]), int(parts[3]))
-        except (IndexError, ValueError):
-            continue
-    return table
-
-
-def as_pid(value):
-    """iTerm2's jobPid as a positive int, or None."""
-    try:
-        pid = int(value)
-    except (TypeError, ValueError):
-        return None
-    return pid if pid > 0 else None
-
-
-def child_map(table):
-    """parent pid -> child pids, built once per scan."""
-    children = {}
-    for pid, (ppid, _, _) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    return children
-
-
-def tree_usage(table, root, children=None):
-    """(% CPU, memory in MB) of a process and all its children: the agent, its MCP servers and
-    the commands it runs. macOS %CPU is a decaying recent average."""
-    children = child_map(table) if children is None else children
-    cpu = kb = 0.0
-    todo, seen = [root], set()
-    while todo:
-        pid = todo.pop()
-        if pid in seen or pid not in table:
-            continue
-        seen.add(pid)
-        cpu += table[pid][1]
-        kb += table[pid][2]
-        todo.extend(children.get(pid, []))
-    return round(cpu, 1), round(kb / 1024)
 
 
 def hot_update(hot_since, sid, state, cpu, now, cfg_pct, cfg_min):
@@ -541,6 +380,11 @@ async def write_peek(app, sid):
             lines = [screen.line(i).string.rstrip() for i in range(screen.number_of_lines)]
         except Exception:  # noqa: BLE001 - a closed or odd session: show nothing
             lines = []
+    write_peek_lines(sid, lines)
+
+
+def write_peek_lines(sid, lines):
+    lines = list(lines)
     while lines and not lines[-1]:
         lines.pop()
     states.HOME.mkdir(parents=True, exist_ok=True)
@@ -549,14 +393,15 @@ async def write_peek(app, sid):
     tmp.replace(PEEK_FILE)
 
 
-async def handle_requests(app, ours, last_focus):
+async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None):
     """Clicks from the hover panel: raise the tab (unbury if needed), select it and bring
     iTerm2 to the front. The click counts as a focus, not a pin: the normal rules apply
     from then on, so an idle tab is buried again after idle_park_s without focus.
     Works in dry run too: it is the person's own action.
     "pin" / "unpin" (panel right-click): a pinned tab is never parked; the rules raise it
     if it is buried.
-    "resume" (a closed agent in the panel's search): see open_resume_tab."""
+    "resume" (a closed agent in the panel's search): see open_resume_tab.
+    A remote row (session "host:tmux-..."): "peek" reads its tmux pane, "raise" see raise_remote."""
     buried_now = {x.session_id for x in app.buried_sessions}
     for f in pending_requests():
         try:
@@ -565,6 +410,18 @@ async def handle_requests(app, ours, last_focus):
             req = {}
         f.unlink(missing_ok=True)
         sid = req.get("session", "")
+        far = remote.split_sid(sid)
+        host = next((h for h in hosts if far and h.name == far[0]), None)
+        row = host.fresh_rows().get(far[1]) if host else None
+        if far and req.get("action") in ("peek", "raise"):
+            if row is None:
+                log("remote_request", session=sid, action=req.get("action"), found=False)
+            elif req["action"] == "peek":
+                write_peek_lines(sid, (await asyncio.to_thread(host.peek, row["pane"]))[-PEEK_LINES:])
+            else:
+                await raise_remote(app, host, row, {} if remote_tabs is None else remote_tabs)
+                last_focus[sid] = time.time()
+            continue
         if req.get("action") == "peek" and sid:
             await write_peek(app, sid)
             continue
@@ -617,6 +474,91 @@ async def open_resume_tab(app, req):
     log("resume_request", ok=True, agent=agent, agent_session=sid, new_session=session.session_id)
 
 
+REMOTE_VAR = "user.remoteTmux"  # on a local tab that the daemon opened for a remote tmux session
+
+
+async def remote_tag(session, remote_tabs):
+    """'host:tmux session' of a local tab opened by raise_remote, or ''. Read once per tab."""
+    if session.session_id not in remote_tabs:
+        try:
+            remote_tabs[session.session_id] = await session.async_get_variable(REMOTE_VAR) or ""
+        except Exception:  # noqa: BLE001 - a closed session
+            return ""
+    return remote_tabs[session.session_id]
+
+
+async def raise_remote(app, host, row, remote_tabs):
+    """A click on a remote row. The local tab opened before for that host and tmux session: select
+    the row's window and pane there (tmux), or attach again if the connection ended. Else a new
+    tab in the front window that runs the host's "attach" command."""
+    tag = f"{host.name}:{row['tmux_session']}"
+    target = None
+    for w in app.terminal_windows:
+        for t in w.tabs:
+            for s in t.sessions:
+                if target is None and await remote_tag(s, remote_tabs) == tag:
+                    target = s
+    command = host.attach_command(row)
+    if target is not None:
+        if await target.async_get_variable("jobName") in remote.SHELLS:
+            if command:  # the connection ended: attach again in the same tab
+                await target.async_send_text(command + "\n")
+        else:
+            await asyncio.to_thread(host.select, row["pane"])
+    elif command:
+        window = app.current_terminal_window
+        if window is not None:
+            target = (await window.async_create_tab()).current_session
+        else:
+            window = await iterm2.Window.async_create(app.connection)
+            target = window.current_tab.current_session
+        await target.async_set_variable(REMOTE_VAR, tag)
+        remote_tabs[target.session_id] = tag
+        await asyncio.sleep(0.5)  # let the new shell start, so it reads the typed text at its prompt
+        await target.async_send_text(command + "\n")
+    else:
+        log("remote_raise", host=host.name, pane=row["pane"], ok=False, why="no attach command")
+        return
+    await target.async_activate(select_tab=True, order_window_front=True)
+    await app.async_activate(raise_all_windows=False, ignoring_other_apps=True)
+    log("remote_raise", host=host.name, pane=row["pane"], ok=True, tab=target.session_id)
+
+
+def remote_panel_rows(hosts, now, started, focus_tag, last_focus, pins, done_at, notified, notify_reset):
+    """Panel rows of the remote hosts' agents. Claude's status file has no "done": a remote agent
+    that went from working to idle shows as done until the person looks at it (focus or click)."""
+    out = []
+    for h in hosts:
+        for key, r in h.fresh_rows(now).items():
+            sid = f"{h.name}:{key}"
+            state = r["state"]
+            if state == states.WORKING:
+                done_at[sid] = None
+            elif state == states.IDLE and sid in done_at and done_at[sid] is None:
+                done_at[sid] = r["since"]  # seen working, now idle: the turn is done
+            focused = bool(focus_tag) and focus_tag == f"{h.name}:{r['tmux_session']}" and r["active"]
+            if focused:
+                last_focus[sid] = now
+            lf = last_focus.setdefault(sid, started if r["since"] < started - 60 else 0.0)
+            if state == states.IDLE and done_at.get(sid) and lf < done_at[sid]:
+                state = states.DONE
+            done_at.setdefault(sid, None if state == states.WORKING else 0.0)
+            resets = r.get("resets_at")
+            if (notify_reset and state == states.WAITING and isinstance(resets, (int, float)) and resets <= now
+                    and (sid, resets) not in notified):
+                notified.add((sid, resets))
+                notify("Agent can continue", f"{r['name']} ({h.name}): the usage limit is over")
+                log("limit_reset_notify", session=sid)
+            out.append({"session": sid, "name": r["name"], "agent": r["agent"], "state": state, "cwd": r["cwd"],
+                        "detail": r.get("detail", ""), "question": r.get("question"), "resets_at": resets,
+                        "since": r["since"], "last": r["since"], "buried": False, "focused": focused,
+                        "pinned": sid in pins, "model": r.get("model"), "cpu": r.get("cpu"),
+                        "mem_mb": r.get("mem_mb"), "hot": False,
+                        "unseen": state == states.DONE and not focused and lf < r["since"],
+                        "host": h.name, "place": f"{r['tmux_session']}:{r['window']}"})
+    return out
+
+
 async def restore_all(app):
     """Newest bury first: each saved index is exact for the window as it was at that bury."""
     buried = load_buried()
@@ -650,14 +592,19 @@ async def run(conn, args):
     models = {}  # session -> (time read, model or None)
     usage, hot, hot_since, usage_ts = {}, {}, {}, 0.0  # session -> (cpu, MB) / bool / time hot began
     codex_paths, codex_ts = {}, 0.0  # Codex session ID -> its session file
+    agy_ts = 0.0
     daemon_cfg = states.load_config().get("daemon")
     notify_reset = not (isinstance(daemon_cfg, dict) and daemon_cfg.get("notify_limit_reset") is False)
     update_on = states.load_config().get("update_check") is True
     update = load_update() if update_on else {}
     update_ts = update.get("checked", 0.0) if isinstance(update.get("checked"), (int, float)) else 0.0
     seed_checked, seed_ts = {}, 0.0
+    hosts = remote.load_hosts(states.load_config(), log=log)  # config.json "remote": none by default
+    remote_tabs, remote_done, remote_notified = {}, {}, set()
+    for h in hosts:
+        h.start()
     log("start", apply=args.apply, n=cfg.n_active, idle_park_s=cfg.idle_park_s,
-        working_park_s=cfg.working_park_s)
+        working_park_s=cfg.working_park_s, remote=[h.name for h in hosts])
     while not stop.is_set():
         now = time.time()
         t0 = time.monotonic()
@@ -687,13 +634,13 @@ async def run(conn, args):
             if recs.get(sid, {}).get("state") != pinned[sid]:
                 pinned.pop(sid)
         pins = load_pins()
-        if any(sid not in where and sid not in buried_now for sid in pins):  # tab closed
-            pins = {sid for sid in pins if sid in where or sid in buried_now}
-            save_pins(pins)
+        if any(sid not in where and sid not in buried_now and not remote.split_sid(sid) for sid in pins):
+            pins = {sid for sid in pins if sid in where or sid in buried_now or remote.split_sid(sid)}
+            save_pins(pins)  # a local tab closed
 
         if pending_requests():
             t = time.monotonic()
-            await handle_requests(app, ours, last_focus)
+            await handle_requests(app, ours, last_focus, hosts, remote_tabs)
             parts["requests"] = time.monotonic() - t
             await app.async_refresh()
             await focus.refresh(app)
@@ -741,6 +688,12 @@ async def run(conn, args):
                 session = app.get_session_by_id(sid)
                 if session is not None:
                     names[sid] = clean_name(await session.async_get_variable("autoName"))
+            agy = {sid: recs[sid].get("agent_session") for sid in listed if recs[sid].get("agent") == "agy"}
+            if agy:  # agy's terminal title is fixed: use its conversation title
+                titles = agents.agy_titles(agy.values())
+                for sid, conversation in agy.items():
+                    if titles.get(conversation):
+                        names[sid] = titles[conversation]
             names_ts = now
             parts["names"] = time.monotonic() - t
         if update_on and now - update_ts > UPDATE_EVERY_S:
@@ -762,21 +715,13 @@ async def run(conn, args):
                 aid = rec["agent_session"]
                 if not codex_paths.get(aid):
                     codex_paths[aid] = states.codex_rollout(aid)
-                turn = states.codex_last_turn(codex_paths[aid])
-                end = states.codex_turn_state(turn)
+                new = codex_turn_update(rec, codex_paths[aid], now)
                 latest = states.read_state(sid) or {}
-                if end and latest.get("ts") == rec.get("ts"):  # no newer hook event meanwhile
-                    state, detail, question = end
-                    ended = turn.get("completed_at")
-                    new = {**rec, "state": state, "detail": detail, "event": "codex_turn_end",
-                           "ts": float(ended) if isinstance(ended, (int, float)) and ended <= now else now}
-                    if question:
-                        new["question"] = question
-                    if detail == "usage limit":
-                        new["resets_at"] = states.codex_resets_at(codex_paths[aid])
+                if new and latest.get("ts") == rec.get("ts"):  # no newer hook event meanwhile
                     states.write_state(sid, new)
                     recs[sid] = new
-                    log("codex_turn_end", session=sid, state=state, detail=detail, resets_at=new.get("resets_at"))
+                    log("codex_turn_end", session=sid, state=new["state"], detail=new["detail"],
+                        resets_at=new.get("resets_at"))
             # The usage limit is over: tell the person once (the agent does not go on by itself).
             for sid in listed:
                 rec = recs[sid]
@@ -789,6 +734,28 @@ async def run(conn, args):
                         states.write_state(sid, recs[sid])
                         notify("Agent can continue", f"{names.get(sid) or rec.get('cwd') or sid}: the usage limit is over")
                         log("limit_reset_notify", session=sid)
+        if now - agy_ts > AGY_SCAN_S:
+            agy_ts = now
+            for sid in listed:
+                rec = recs[sid]
+                by_us = rec.get("event") == "agy_waiting"
+                if rec.get("agent") != "agy" or not (rec.get("state") == states.WORKING or by_us):
+                    continue
+                step = await asyncio.to_thread(agents.agy_waiting_step, rec.get("agent_session"))
+                if (latest := states.read_state(sid) or {}).get("ts") != rec.get("ts"):
+                    continue  # a hook wrote meanwhile
+                if step and not by_us:
+                    tool, call = step
+                    new = {**rec, "state": states.WAITING, "detail": f"approve {tool}", "event": "agy_waiting",
+                           "ts": now, "question": agents.agy_question(tool, call)[:1500]}
+                elif by_us and not step:  # answered, and no hook event yet
+                    new = {**rec, "state": states.WORKING, "detail": "", "event": "agy_resumed", "ts": now}
+                    new.pop("question", None)
+                else:
+                    continue
+                states.write_state(sid, new)
+                recs[sid] = new
+                log("agy_prompt", session=sid, state=new["state"], detail=new["detail"])
         if now - usage_ts > USAGE_SCAN_S:
             t = time.monotonic()
             table = await asyncio.to_thread(process_table)
@@ -805,7 +772,12 @@ async def run(conn, args):
         for sid in listed:
             if now - models.get(sid, (0, None))[0] > MODEL_REFRESH_S:
                 path = search.transcript(recs[sid].get("agent", ""), recs[sid].get("agent_session"))
-                models[sid] = (now, search.transcript_model(path) if path else None)
+                # agy names its model in each hook event (no transcript lookup here)
+                models[sid] = (now, search.transcript_model(path) if path else recs[sid].get("model"))
+        focus_tag = (await remote_tag(app.get_session_by_id(focus.session), remote_tabs)
+                     if hosts and focus.session and focus.app_active and app.get_session_by_id(focus.session) else "")
+        far_rows = remote_panel_rows(hosts, now, started, focus_tag, last_focus, pins, remote_done,
+                                     remote_notified, notify_reset)
         write_panel([{"session": sid, "name": names.get(sid) or Path(recs[sid].get("cwd") or "?").name,
                       "agent": recs[sid].get("agent", ""), "state": recs[sid]["state"],
                       "cwd": recs[sid].get("cwd") or "",
@@ -819,7 +791,7 @@ async def run(conn, args):
                       "cpu": usage.get(sid, (None, None))[0], "mem_mb": usage.get(sid, (None, None))[1],
                       "hot": hot.get(sid, False),
                       "unseen": recs[sid]["state"] == states.DONE and not focus.has(sid)
-                                and last_focus.get(sid, 0) < recs[sid]["ts"]} for sid in listed],
+                                and last_focus.get(sid, 0) < recs[sid]["ts"]} for sid in listed] + far_rows,
                     args.apply, update=bool(update_on and update.get("available")))
 
         d = decide(tabs, now, cfg, focus.changed_ts, counts)
@@ -861,13 +833,15 @@ async def run(conn, args):
             if stop.is_set() or pending_requests():
                 break
 
+    for h in hosts:
+        h.stop()
     if args.apply:
         await restore_all(app)
     log("stop")
 
 
 DAEMON_DEFAULTS = {"n": ("n_active", 5), "idle_min": ("idle_min", 20.0),
-                   "working_park_s": ("working_park_s", 120.0),
+                   "working_park_s": ("working_park_s", 0.0),
                    "cpu_hot_pct": ("cpu_hot_pct", 50.0), "cpu_hot_min": ("cpu_hot_min", 2.0)}
 
 
@@ -881,8 +855,8 @@ def apply_config(args, config):
             setattr(args, attr, value if isinstance(value, (int, float)) else default)
     agents_cfg = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     for name in agents_cfg.get("extra") or []:
-        if isinstance(name, str) and name and name not in AGENTS:
-            AGENTS.append(name)
+        if isinstance(name, str) and name and name not in agents.AGENTS:
+            agents.AGENTS.append(name)
 
 
 def main():

@@ -5,8 +5,10 @@
   python -m agent_hover.config_edit restore [--apply] [--force] [--backup DIR]
 
 Without --apply nothing is written; the planned change is printed.
-install   backs up both files (exact bytes) to ~/.agent-hover/backup/<time>/, then adds only
-          entries tagged with "agent_hover/hook.py". Other hooks, cc-status included, stay.
+install   backs up the files (exact bytes) to ~/.agent-hover/backup/<time>/, then adds only
+          entries tagged with "agent_hover/hook.py" (in ~/.gemini/config/hooks.json: the
+          "agent-hover" entry; the file is made if agy is installed and it is missing).
+          Other hooks, cc-status included, stay.
 uninstall removes only the tagged entries; all other later changes stay.
 restore   copies the exact backup back. It refuses if the file changed after install,
           unless --force (later changes would be lost).
@@ -29,6 +31,10 @@ PROJ = Path(__file__).resolve().parent.parent
 TAG = "agent_hover/hook.py"
 CLAUDE_FILE = Path.home() / ".claude" / "settings.json"
 CODEX_FILE = Path.home() / ".codex" / "config.toml"
+# Antigravity hooks: one file for the agy CLI, the Antigravity IDE and app. Made by the install if
+# agy is installed (~/.gemini/config exists) and the file is missing; restore then removes it.
+AGY_FILE = Path.home() / ".gemini" / "config" / "hooks.json"
+AGY_HOOK_NAME = "agent-hover"
 CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
                  "PostToolUse", "Notification", "Stop", "StopFailure"]
 CODEX_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
@@ -107,6 +113,23 @@ def codex_with_ours(text):
     return text.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
 
 
+# ---- Antigravity (JSON: hook name -> events) -------------------------------------------
+
+def agy_without_ours(data):
+    data.pop(AGY_HOOK_NAME, None)
+    return data
+
+
+def agy_with_ours(data):
+    data = agy_without_ours(data)
+    entry = {}
+    for event in states.AGY_EVENTS:
+        handler = {"type": "command", "command": f"{hook_cmd('agy')} {event}", "timeout": 5}
+        entry[event] = [{"matcher": "*", "hooks": [handler]}] if event in ("PreToolUse", "PostToolUse") else [handler]
+    data[AGY_HOOK_NAME] = entry
+    return data
+
+
 # ---- planning and writing ------------------------------------------------------------
 
 def plan(mode):
@@ -128,6 +151,14 @@ def plan(mode):
         tomllib.loads(new)  # refuse to write a file Codex cannot read
         if new != text:
             out.append((CODEX_FILE, raw, new.encode(), text, new))
+    if AGY_FILE.exists() or (mode == "install" and AGY_FILE.parent.is_dir()):
+        raw = AGY_FILE.read_bytes() if AGY_FILE.exists() else b""
+        old = json.loads(raw) if raw.strip() else {}
+        new = agy_with_ours(json.loads(raw) if raw.strip() else {}) if mode == "install" else agy_without_ours(dict(old))
+        new_bytes = (json.dumps(new, indent=2, ensure_ascii=False) + "\n").encode()
+        if new != old:
+            out.append((AGY_FILE, raw, new_bytes, json.dumps(old, indent=2, ensure_ascii=False) if raw else "",
+                        new_bytes.decode()))
     return out
 
 
@@ -136,7 +167,7 @@ def write(path, data, expect=None, mode=None):
 
     expect: the bytes the plan was made from. If the file changed since then (Claude Code,
     Codex or iTerm2 wrote it), refuse, so their new content is not lost."""
-    if expect is not None and path.read_bytes() != expect:
+    if expect is not None and (path.read_bytes() if path.exists() else b"") != expect:
         sys.exit(f"Refused: {path} changed while this ran. Nothing more written. Run the command again.")
     if mode is None:
         mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
@@ -161,14 +192,20 @@ def cmd_install(apply):
     if not apply:
         print("\nDry run. Nothing written. Run again with --apply to install.")
         return
-    bdir = states.BACKUP_DIR / time.strftime("%Y%m%d-%H%M%S")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    bdir = states.BACKUP_DIR / stamp
+    n = 1
+    while bdir.exists():  # two installs in one second
+        bdir, n = states.BACKUP_DIR / f"{stamp}-{n}", n + 1
     bdir.mkdir(parents=True)
     # Backups and the manifest come first, so a crash after one file is written can be restored.
     manifest = {}
     for path, old, new, _, _ in changes:
         (bdir / path.name).write_bytes(old)
-        shutil.copymode(path, bdir / path.name)
-        manifest[str(path)] = {"backup": str(bdir / path.name), "sha_before": sha(old), "sha_written": sha(new)}
+        if path.exists():
+            shutil.copymode(path, bdir / path.name)
+        manifest[str(path)] = {"backup": str(bdir / path.name), "sha_before": sha(old), "sha_written": sha(new),
+                               **({} if path.exists() else {"created": True})}
     (bdir / "manifest.json").write_text(json.dumps(manifest, indent=1))
     for path, old, new, _, _ in changes:
         write(path, new, expect=old)
@@ -224,6 +261,11 @@ def cmd_restore(apply, force, backup):
         print("\nDry run. Nothing written. Run again with --apply to restore the exact backup.")
         return
     for p, now, backup in todo:
+        if manifest[str(p)].get("created"):  # the install made this file: remove it again
+            if (p.read_bytes() if p.exists() else b"") != now:
+                sys.exit(f"Refused: {p} changed while this ran. Nothing more written. Run the command again.")
+            p.unlink(missing_ok=True)
+            continue
         write(p, backup.read_bytes(), expect=now, mode=stat.S_IMODE(backup.stat().st_mode))
     print("\nRestored the exact backup (content and permissions).")
 

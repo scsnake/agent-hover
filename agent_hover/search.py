@@ -50,7 +50,7 @@ CLOSED_LIMIT = 20
 
 
 def live_tabs():
-    """[{session, name, agent, cwd, agent_session}] for the rows the panel shows."""
+    """[{session, name, agent, cwd, agent_session, host}] for the rows the panel shows."""
     try:
         rows = json.loads((states.HOME / "panel.json").read_text())["rows"]
     except (OSError, ValueError, KeyError):
@@ -60,7 +60,8 @@ def live_tabs():
     for r in rows:
         rec = recs.get(r["session"], {})
         out.append({"session": r["session"], "name": r.get("name") or "", "agent": r.get("agent", ""),
-                    "cwd": rec.get("cwd") or r.get("cwd") or "", "agent_session": rec.get("agent_session")})
+                    "cwd": rec.get("cwd") or r.get("cwd") or "", "agent_session": rec.get("agent_session"),
+                    "host": r.get("host")})
     return out
 
 
@@ -348,7 +349,8 @@ def search_closed(keyword, chat=False, days=None, tabs=None):
         return []
     tabs = live_tabs() if tabs is None else tabs
     live_ids = {t["agent_session"] for t in tabs if t["agent_session"]}
-    live_names = {(t["agent"], t["name"]) for t in tabs if not t["agent_session"]}
+    # A remote host's agent (no local session ID) is not a local closed session.
+    live_names = {(t["agent"], t["name"]) for t in tabs if not t["agent_session"] and not t.get("host")}
     k = keyword.lower()
     out = []
     for c in closed_sessions(days, live_ids, live_names):

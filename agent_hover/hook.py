@@ -1,7 +1,8 @@
-"""Agent hook: one event on stdin -> one state file. Usage: hook.py claude|codex
+"""Agent hook: one event on stdin -> one state file. Usage: hook.py claude|codex|agy [EVENT]
 
-It prints nothing (Codex Stop hooks must print nothing or JSON) and always exits 0,
-so a bug here never blocks the agent.
+It prints nothing (Codex Stop hooks must print nothing or JSON) and always exits 0, so a bug
+here never blocks the agent. For agy it always prints the JSON answer agy needs ("allow" for
+PreToolUse: agy's own permission rules still decide).
 """
 import json
 import subprocess
@@ -45,9 +46,11 @@ def main():
         payload = json.load(sys.stdin)
     except ValueError:
         return
+    if agent == "agy":
+        payload = states.agy_payload(sys.argv[2] if len(sys.argv) > 2 else "", payload)
     # A background job has no tab environment: find its tab through the session ID.
-    uuid = states.iterm_session_uuid() or states.tab_for_session(
-        payload.get("session_id"), payload.get("transcript_path"))
+    uuid = states.iterm_session_uuid() or (None if agent == "agy" else states.tab_for_session(
+        payload.get("session_id"), payload.get("transcript_path")))
     if not uuid:
         return
     mapped = states.map_event(agent, payload)
@@ -57,6 +60,7 @@ def main():
                                        "event": payload.get("hook_event_name"),
                                        "tool": payload.get("tool_name"),
                                        "type": payload.get("notification_type"),
+                                       **({"session": payload.get("session_id")} if agent == "agy" else {}),
                                        "state": mapped[0] if mapped else None,
                                        **({"nested": True} if nested else {})})
     if not mapped or nested:
@@ -66,9 +70,17 @@ def main():
     if (payload.get("hook_event_name") == "PostToolUse" and prev.get("state") == states.DONE
             and prev.get("agent") == agent):
         return  # a background command can end after Stop: the turn is still done
+    other = (agent == "agy" and prev.get("agent") == "agy" and prev.get("state") == states.WORKING
+             and prev.get("agent_session") and payload.get("session_id") != prev["agent_session"])
+    if other:
+        if payload.get("hook_event_name") in ("Stop", "SessionStart"):
+            return  # likely a sub-agent's own conversation: the main turn still runs
+        payload["session_id"] = prev["agent_session"]
     record = {"iterm": uuid, "agent": agent, "state": state, "detail": detail,
               "event": payload.get("hook_event_name"), "ts": now,
-              "agent_session": payload.get("session_id"), "cwd": payload.get("cwd")}
+              "agent_session": payload.get("session_id"), "cwd": payload.get("cwd") or prev.get("cwd")}
+    if agent == "agy":  # agy names its model and transcript in every event
+        record.update(model=payload.get("model") or prev.get("model"), transcript=payload.get("transcript_path"))
     if state == states.WAITING:
         record["question"] = waiting_question(uuid, payload)
     states.write_state(uuid, record)
@@ -81,4 +93,6 @@ if __name__ == "__main__":
         main()
     except Exception:  # never break the agent
         pass
+    if sys.argv[1:2] == ["agy"]:  # agy needs a decision for PreToolUse and Stop, also after an error
+        print(json.dumps(states.AGY_REPLY.get(sys.argv[2] if len(sys.argv) > 2 else "", {})))
     sys.exit(0)

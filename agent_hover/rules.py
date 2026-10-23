@@ -8,7 +8,7 @@ from agent_hover.states import DONE, IDLE, WAITING, WORKING
 class Config:
     n_active: int = 5            # max visible agent tabs, when the rules can keep to it
     idle_park_s: float = 20 * 60  # park a seen "done" or "idle" tab after this time
-    working_park_s: float = 120   # park a working tab this long after it lost focus
+    working_park_s: float = 0     # park a working tab this long after it lost focus; 0 = never by time
     settle_s: float = 3           # do nothing this soon after a focus change
 
 
@@ -51,8 +51,8 @@ def parkable(t, now, cfg):
     # just came back (done) and went to working again (a background subagent) gets a new
     # working_park_s, and is not buried again at once.
     since = now - max(t.last_focus_ts, t.state_since or t.state_ts)
-    if t.state == WORKING:
-        return since > cfg.working_park_s
+    if t.state == WORKING:  # by default only the n_active limit parks a working tab
+        return cfg.working_park_s > 0 and since > cfg.working_park_s
     if t.state in (DONE, IDLE):
         return since > cfg.idle_park_s
     return False

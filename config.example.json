@@ -14,13 +14,16 @@
   "daemon": {
     "n_active": 5,
     "idle_min": 20,
-    "working_park_s": 120,
+    "working_park_s": 0,
     "cpu_hot_pct": 50,
     "cpu_hot_min": 2,
     "notify_limit_reset": true
   },
   "agents": {
     "extra": []
+  },
+  "remote": {
+    "hosts": []
   },
   "update_check": false
 }
