@@ -122,6 +122,56 @@ def codex_rollout(session_id):
     return found[-1] if found else None
 
 
+CODEX_TURN_TYPES = ("task_started", "task_complete", "turn_aborted")
+
+
+def codex_last_turn(path, tail_bytes=262144):
+    """The last turn record of the main agent in a Codex session file (task_started,
+    task_complete or turn_aborted payload), or None. Codex sends no Stop hook when a turn ends
+    with an error (for example usage_limit_exceeded), so the file is the only sign."""
+    for line in reversed(_file_part(path, tail_bytes, tail=True).splitlines()):
+        if '"event_msg"' not in line or not any(f'"{t}"' in line for t in CODEX_TURN_TYPES):
+            continue
+        try:
+            payload = json.loads(line).get("payload") or {}
+        except (ValueError, AttributeError):
+            continue  # the cut first line of the tail
+        if payload.get("type") not in CODEX_TURN_TYPES:
+            continue
+        if payload.get("root_turn_id", payload.get("turn_id")) != payload.get("turn_id"):
+            continue  # a sub-agent's turn
+        return payload
+    return None
+
+
+def codex_turn_state(payload):
+    """(state, detail, question) for a Codex turn that ended without a Stop hook, or None."""
+    if not payload:
+        return None
+    if payload.get("type") == "turn_aborted":
+        return IDLE, "interrupted", None
+    error = payload.get("error") if payload.get("type") == "task_complete" else None
+    if not isinstance(error, dict):
+        return None
+    message = str(error.get("message") or "Codex stopped with an error.")
+    if error.get("codex_error_info") == "usage_limit_exceeded":
+        # The Codex screen then asks whether to switch to a smaller model.
+        return WAITING, "usage limit", "Codex hit its usage limit.\n" + message
+    return DONE, "error", None
+
+
+def codex_seed_state(payload):
+    """(state, detail, question) of a Codex tab from its last turn record (for a tab with no
+    hook event yet): a started turn is working, a normal end is done, see codex_turn_state."""
+    if not payload:
+        return None
+    if payload.get("type") == "task_started":
+        return WORKING, "", None
+    if payload.get("type") == "task_complete" and not payload.get("error"):
+        return DONE, "", None
+    return codex_turn_state(payload)
+
+
 SDK_CLI_RE = re.compile(r'"entrypoint":\s*"sdk-cli"')  # Claude transcript line of a `claude -p` run
 CODEX_EXEC_RE = re.compile(r'"source":\s*"exec"|"originator":\s*"codex_exec"')  # Codex session_meta
 

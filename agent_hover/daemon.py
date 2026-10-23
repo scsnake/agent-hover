@@ -28,6 +28,7 @@ TICK_S = 1.0
 NAME_REFRESH_S = 5.0
 MODEL_REFRESH_S = 30.0  # read each tab's model from its transcript this often
 USAGE_SCAN_S = 5.0  # CPU and memory of each agent's process tree, this often
+CODEX_SCAN_S = 5.0  # read the end of each working Codex tab's session file this often
 UPDATE_FILE = states.HOME / "update.json"
 UPDATE_EVERY_S = 86400.0  # the opt-in update check ("update_check": true in config.json), once a day
 REPO = Path(__file__).resolve().parent.parent
@@ -85,6 +86,56 @@ def claude_session(pid):
     except (OSError, ValueError, TypeError):
         return None
     return data if isinstance(data, dict) and data.get("pid") == pid else None
+
+
+CODEX_PIDS = {}  # Codex process ID -> its main session file, found once with lsof
+
+
+def codex_main_rollout(pid):
+    """The session file of a running Codex process's main thread (it keeps its session files
+    open; sub-agent threads have their own, marked "thread_source":"subagent"), or None."""
+    if pid in CODEX_PIDS:
+        return CODEX_PIDS[pid]
+    found = None
+    try:
+        out = subprocess.run(["lsof", "-p", str(int(pid)), "-Fn"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        path = line[1:]
+        if line.startswith("n") and "/.codex/sessions/" in path and Path(path).name.startswith("rollout-"):
+            head = states._file_part(path, 8192, tail=False)
+            if re.search(r'"thread_source":\s*"user"', head) and not states.CODEX_EXEC_RE.search(head):
+                found = path
+                break
+    if found:  # none yet (a new Codex may not have written its file): look again next scan
+        CODEX_PIDS[pid] = found
+    return found
+
+
+def with_codex_session(rec, path):
+    """A seeded Codex record with the session ID, folder and state from its session file."""
+    if not path:
+        return rec
+    new = dict(rec)
+    sid = Path(path).stem[-36:]
+    if states.UUID_RE.fullmatch(sid):
+        new["agent_session"] = sid
+    m = re.search(r'"cwd":\s*"((?:[^"\\]|\\.)*)"', states._file_part(path, 8192, tail=False))
+    if m:
+        new["cwd"] = json.loads(f'"{m.group(1)}"')
+    turn = states.codex_last_turn(path)
+    found = states.codex_seed_state(turn)
+    if found and found[0] != rec.get("state"):
+        state, detail, question = found
+        when = turn.get("completed_at") or turn.get("started_at")
+        new.update(state=state, detail=detail, ts=float(when) if isinstance(when, (int, float)) else time.time())
+        if question:
+            new["question"] = question
+    if new.get("detail") == "seen by daemon":
+        new["detail"] = ""
+    return new
 
 
 def with_claude_session(rec, info, now):
@@ -153,8 +204,9 @@ async def seed_agents(app, known, checked):
                             checked[sid] = pid
                             continue
                     checked[sid] = pid
-                    if rec.get("agent") == "claude":
-                        new = with_claude_session(rec, claude_session(pid), now)
+                    if rec.get("agent") in ("claude", "codex"):
+                        new = (with_claude_session(rec, claude_session(pid), now) if rec["agent"] == "claude"
+                               else with_codex_session(rec, codex_main_rollout(pid)))
                         latest = states.read_state(sid) or {}
                         if new != rec and latest.get("event") == "seed":  # a hook may have just written
                             states.write_state(sid, new)
@@ -173,6 +225,8 @@ async def seed_agents(app, known, checked):
                                       await s.async_get_variable("path"), now)
                     if agent == "claude":
                         rec = with_claude_session(rec, claude_session(pid), now)
+                    elif agent == "codex":
+                        rec = with_codex_session(rec, codex_main_rollout(pid))
                     states.write_state(sid, rec)
                     log("seed", session=sid, agent=agent, state=rec["state"],
                         agent_session=rec.get("agent_session"))
@@ -582,6 +636,7 @@ async def run(conn, args):
     names, names_ts = {}, 0.0
     models = {}  # session -> (time read, model or None)
     usage, hot, hot_since, usage_ts = {}, {}, {}, 0.0  # session -> (cpu, MB) / bool / time hot began
+    codex_paths, codex_ts = {}, 0.0  # Codex session ID -> its session file
     update_on = states.load_config().get("update_check") is True
     update = load_update() if update_on else {}
     update_ts = update.get("checked", 0.0) if isinstance(update.get("checked"), (int, float)) else 0.0
@@ -683,6 +738,28 @@ async def run(conn, args):
                 tmp.write_text(json.dumps(update))
                 tmp.replace(UPDATE_FILE)
             log("update_check", ok=found is not None, available=bool(found and found["available"]))
+        if now - codex_ts > CODEX_SCAN_S:
+            codex_ts = now
+            for sid in listed:
+                rec = recs[sid]
+                if rec.get("agent") != "codex" or rec.get("state") != states.WORKING or not rec.get("agent_session"):
+                    continue
+                aid = rec["agent_session"]
+                if not codex_paths.get(aid):
+                    codex_paths[aid] = states.codex_rollout(aid)
+                turn = states.codex_last_turn(codex_paths[aid])
+                end = states.codex_turn_state(turn)
+                latest = states.read_state(sid) or {}
+                if end and latest.get("ts") == rec.get("ts"):  # no newer hook event meanwhile
+                    state, detail, question = end
+                    ended = turn.get("completed_at")
+                    new = {**rec, "state": state, "detail": detail, "event": "codex_turn_end",
+                           "ts": float(ended) if isinstance(ended, (int, float)) and ended <= now else now}
+                    if question:
+                        new["question"] = question
+                    states.write_state(sid, new)
+                    recs[sid] = new
+                    log("codex_turn_end", session=sid, state=state, detail=detail)
         if now - usage_ts > USAGE_SCAN_S:
             t = time.monotonic()
             table = await asyncio.to_thread(process_table)

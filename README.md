@@ -178,6 +178,7 @@ Everything stays on your Mac. There are no network calls, except the update chec
 - The chat search and the model name in the hover frame read the agents' own transcript files (`~/.claude/projects`, `~/.codex/sessions`), only when you search or for the open tabs.
 - The chat search keeps a copy of the message text (no tool output) in `~/.agent-hover/chatcache/`, so a search takes well under 0.1 s. Entries of deleted transcripts are removed at the next chat search. You can delete the folder at any time; the next search builds it again.
 - For an agent tab with no hook event yet, the daemon reads Claude Code's own process file (`~/.claude/sessions/<pid>.json`) for its session ID, folder and state. It also reads the process list (`ps`) for CPU and memory.
+- For a working Codex tab, the daemon reads the end of its session file (`~/.codex/sessions`) every 5 s. Codex sends no hook when a turn ends with an error, so this is how a usage-limit stop shows as **waiting** (Codex then asks whether to switch to a smaller model). A Codex tab with no hook event yet is matched to its session file through the files its process has open (`lsof`).
 - Peek reads the hovered tab's screen through iTerm2, and keeps the last lines in `~/.agent-hover/peek.json`.
 
 ## How it works
