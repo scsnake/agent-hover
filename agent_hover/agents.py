@@ -243,6 +243,70 @@ def agy_titles(conversations):
     return {cid: title.strip() for cid, title in rows if isinstance(title, str) and title.strip()}
 
 
+def agy_tree():
+    """conversation ID -> (parent ID or "", status) for all agy conversations, read-only. A
+    sub-agent has its own conversation, with the main one as parent. {} on error."""
+    if not AGY_SUMMARIES.exists():
+        return {}
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{AGY_SUMMARIES}?mode=ro", uri=True, timeout=0.5)
+        try:
+            rows = con.execute("select conversation_id, parent_conversation_id, status from conversation_summaries").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+    return {cid: (parent or "", status or "") for cid, parent, status in rows if cid}
+
+
+def agy_root(conversation, tree=None):
+    """(main conversation ID, is_sub_agent) for an agy conversation, through its parents.
+    (conversation, False) if agy has no row for it yet (unknown)."""
+    tree = agy_tree() if tree is None else tree
+    cid, seen = conversation, set()
+    while cid in tree and tree[cid][0] and cid not in seen and len(seen) < 16:
+        seen.add(cid)
+        cid = tree[cid][0]
+    return cid, cid != conversation
+
+
+def agy_running_family(root, tree=None):
+    """The main conversation and its sub-agents that run now (they can ask for permission)."""
+    tree = agy_tree() if tree is None else tree
+    out = [root]
+    for cid, (_, status) in tree.items():
+        if cid != root and status in ("CASCADE_RUN_STATUS_RUNNING", "CASCADE_RUN_STATUS_BUSY") \
+                and agy_root(cid, tree)[0] == root:
+            out.append(cid)
+    return out
+
+
+AGY_BRAIN = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+
+
+def agy_first_prompt(conversation, limit=40):
+    """The first line of the first prompt in an agy conversation, cut to limit characters: the
+    row name until agy has made its own title. None if not found."""
+    if not conversation or not states.UUID_RE.fullmatch(conversation):
+        return None
+    path = AGY_BRAIN / conversation / ".system_generated" / "logs" / "transcript.jsonl"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(50), f):
+                try:
+                    step = json.loads(line)
+                except ValueError:
+                    continue
+                if step.get("type") == "USER_INPUT" and isinstance(step.get("content"), str):
+                    text = re.sub(r"</?USER_REQUEST>", "", step["content"])
+                    first = next((x.strip() for x in text.splitlines() if x.strip()), "")
+                    return (first[: limit - 1] + "…" if len(first) > limit else first) or None
+    except OSError:
+        return None
+    return None
+
+
 AGY_CONVERSATIONS = Path.home() / ".gemini" / "antigravity-cli" / "conversations"
 AGY_STEP_WAITING = 9  # CORTEX_STEP_STATUS_WAITING (enum in agy's protobuf descriptor): asks the person
 

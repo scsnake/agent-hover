@@ -38,7 +38,7 @@ def run_hook(event, payload, env):
 
 
 def test_hook_always_answers_agy(tmp_path):
-    env = {"PATH": os.environ["PATH"], "AGENT_HOVER_HOME": str(tmp_path)}  # no tab: an IDE session
+    env = {"PATH": os.environ["PATH"], "AGENT_HOVER_HOME": str(tmp_path), "HOME": str(tmp_path)}  # no tab: an IDE session
     for event, want in [("PreToolUse", {"decision": "allow"}), ("Stop", {"decision": "stop"}),
                         ("PostToolUse", {}), ("SessionStart", {})]:
         r = run_hook(event, json.dumps(raw()), env)
@@ -49,7 +49,8 @@ def test_hook_always_answers_agy(tmp_path):
 
 
 def test_hook_writes_agy_state(tmp_path):
-    env = {"PATH": os.environ["PATH"], "AGENT_HOVER_HOME": str(tmp_path), "ITERM_SESSION_ID": f"w0t0p0:{UUID}"}
+    env = {"PATH": os.environ["PATH"], "AGENT_HOVER_HOME": str(tmp_path), "HOME": str(tmp_path),
+           "ITERM_SESSION_ID": f"w0t0p0:{UUID}"}
     run_hook("PreToolUse", json.dumps(raw(toolCall={"name": "run_command"})), env)
     rec = json.loads((tmp_path / "state" / f"{UUID}.json").read_text())
     assert (rec["agent"], rec["state"], rec["detail"], rec["agent_session"], rec["cwd"], rec["model"]) == (
@@ -134,3 +135,61 @@ def test_agy_waiting_step(tmp_path, monkeypatch):
     con.close()
     assert agents.agy_waiting_step(CONV) is None
     assert agents.agy_waiting_step("../etc") is None
+
+
+SUB = "0d79c012-115f-4c1f-b1a8-6363ae2d52c6"
+
+
+def summaries(home, rows):
+    import sqlite3
+    d = home / ".gemini" / "antigravity-cli"
+    d.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(d / "conversation_summaries.db")
+    con.execute("create table conversation_summaries (conversation_id text, title text, status text, "
+                "parent_conversation_id text)")
+    con.executemany("insert into conversation_summaries values (?, ?, ?, ?)", rows)
+    con.commit()
+    con.close()
+    return d / "conversation_summaries.db"
+
+
+def test_agy_tree_root_and_family(tmp_path, monkeypatch):
+    db = summaries(tmp_path, [(CONV, "Course Overview", "CASCADE_RUN_STATUS_RUNNING", ""),
+                              (SUB, "", "CASCADE_RUN_STATUS_RUNNING", CONV),
+                              ("22222222-2222-2222-2222-222222222222", "", "CASCADE_RUN_STATUS_IDLE", CONV),
+                              ("33333333-3333-3333-3333-333333333333", "Other", "CASCADE_RUN_STATUS_RUNNING", "")])
+    monkeypatch.setattr(agents, "AGY_SUMMARIES", db)
+    tree = agents.agy_tree()
+    assert agents.agy_root(SUB, tree) == (CONV, True)
+    assert agents.agy_root(CONV, tree) == (CONV, False)
+    assert agents.agy_root("44444444-4444-4444-4444-444444444444", tree)[1] is False  # unknown
+    assert agents.agy_running_family(CONV, tree) == [CONV, SUB]  # the idle sub-agent and others left out
+
+
+def test_agy_first_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(agents, "AGY_BRAIN", tmp_path)
+    logs = tmp_path / CONV / ".system_generated" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "transcript.jsonl").write_text(json.dumps({"type": "USER_INPUT", "content":
+        "<USER_REQUEST>\n\nis there a structural index-like file at the root of the course\nmore\n</USER_REQUEST>"}) + "\n")
+    assert agents.agy_first_prompt(CONV) == "is there a structural index-like file a…"
+    assert agents.agy_first_prompt(SUB) is None and agents.agy_first_prompt("../x") is None
+
+
+def test_hook_reports_the_main_conversation(tmp_path):
+    summaries(tmp_path, [(CONV, "Course Overview", "CASCADE_RUN_STATUS_RUNNING", ""),
+                         (SUB, "", "CASCADE_RUN_STATUS_RUNNING", CONV)])
+    env = {"PATH": os.environ["PATH"], "AGENT_HOVER_HOME": str(tmp_path / "at"), "HOME": str(tmp_path),
+           "ITERM_SESSION_ID": f"w0t0p0:{UUID}"}
+    state = tmp_path / "at" / "state" / f"{UUID}.json"
+    run_hook("PreToolUse", json.dumps(raw(conversationId=SUB, toolCall={"name": "view_file"})), env)
+    assert json.loads(state.read_text())["agent_session"] == CONV  # first event from a sub-agent
+    run_hook("Stop", json.dumps(raw(conversationId=SUB, terminationReason="model_stop")), env)
+    assert json.loads(state.read_text())["state"] == "working"  # a sub-agent's end is not the turn's end
+    # A record linked to a sub-agent before this fix moves to the main conversation.
+    rec = json.loads(state.read_text())
+    state.write_text(json.dumps({**rec, "agent_session": SUB}))
+    run_hook("PreInvocation", json.dumps(raw()), env)
+    assert json.loads(state.read_text())["agent_session"] == CONV
+    run_hook("Stop", json.dumps(raw(terminationReason="model_stop")), env)
+    assert json.loads(state.read_text())["state"] == "done"

@@ -689,11 +689,12 @@ async def run(conn, args):
                 if session is not None:
                     names[sid] = clean_name(await session.async_get_variable("autoName"))
             agy = {sid: recs[sid].get("agent_session") for sid in listed if recs[sid].get("agent") == "agy"}
-            if agy:  # agy's terminal title is fixed: use its conversation title
+            if agy:  # agy's terminal title is fixed: use its conversation title, else the first prompt
                 titles = agents.agy_titles(agy.values())
                 for sid, conversation in agy.items():
-                    if titles.get(conversation):
-                        names[sid] = titles[conversation]
+                    name = titles.get(conversation) or agents.agy_first_prompt(conversation)
+                    if name:
+                        names[sid] = name
             names_ts = now
             parts["names"] = time.monotonic() - t
         if update_on and now - update_ts > UPDATE_EVERY_S:
@@ -736,18 +737,31 @@ async def run(conn, args):
                         log("limit_reset_notify", session=sid)
         if now - agy_ts > AGY_SCAN_S:
             agy_ts = now
-            for sid in listed:
+            agy_rows = [sid for sid in listed if recs[sid].get("agent") == "agy" and recs[sid].get("agent_session")]
+            tree = await asyncio.to_thread(agents.agy_tree) if agy_rows else {}
+            for sid in agy_rows:
                 rec = recs[sid]
+                root, sub = agents.agy_root(rec["agent_session"], tree)
+                if sub and (states.read_state(sid) or {}).get("ts") == rec.get("ts"):
+                    rec = recs[sid] = {**rec, "agent_session": root}  # linked to a sub-agent before: fix
+                    states.write_state(sid, rec)
+                    log("agy_main", session=sid, agent_session=root)
                 by_us = rec.get("event") == "agy_waiting"
-                if rec.get("agent") != "agy" or not (rec.get("state") == states.WORKING or by_us):
+                if not (rec.get("state") == states.WORKING or by_us):
                     continue
-                step = await asyncio.to_thread(agents.agy_waiting_step, rec.get("agent_session"))
-                if (latest := states.read_state(sid) or {}).get("ts") != rec.get("ts"):
+                step, asker = None, root
+                for cid in agents.agy_running_family(root, tree):  # a sub-agent can ask too
+                    step = await asyncio.to_thread(agents.agy_waiting_step, cid)
+                    if step:
+                        asker = cid
+                        break
+                if (states.read_state(sid) or {}).get("ts") != rec.get("ts"):
                     continue  # a hook wrote meanwhile
                 if step and not by_us:
                     tool, call = step
-                    new = {**rec, "state": states.WAITING, "detail": f"approve {tool}", "event": "agy_waiting",
-                           "ts": now, "question": agents.agy_question(tool, call)[:1500]}
+                    new = {**rec, "state": states.WAITING, "event": "agy_waiting", "ts": now,
+                           "detail": f"approve {tool}" + (" (sub-agent)" if asker != root else ""),
+                           "question": agents.agy_question(tool, call)[:1500]}
                 elif by_us and not step:  # answered, and no hook event yet
                     new = {**rec, "state": states.WORKING, "detail": "", "event": "agy_resumed", "ts": now}
                     new.pop("question", None)

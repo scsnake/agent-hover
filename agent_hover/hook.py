@@ -70,12 +70,21 @@ def main():
     if (payload.get("hook_event_name") == "PostToolUse" and prev.get("state") == states.DONE
             and prev.get("agent") == agent):
         return  # a background command can end after Stop: the turn is still done
-    other = (agent == "agy" and prev.get("agent") == "agy" and prev.get("state") == states.WORKING
-             and prev.get("agent_session") and payload.get("session_id") != prev["agent_session"])
-    if other:
-        if payload.get("hook_event_name") in ("Stop", "SessionStart"):
-            return  # likely a sub-agent's own conversation: the main turn still runs
-        payload["session_id"] = prev["agent_session"]
+    if agent == "agy" and payload.get("session_id"):
+        # A sub-agent has its own conversation and fires the same hooks: report the main one.
+        from agent_hover import agents
+        tree = agents.agy_tree()
+        root, sub = agents.agy_root(payload["session_id"], tree)
+        if sub and payload.get("hook_event_name") in ("Stop", "SessionStart"):
+            return  # a sub-agent started or ended: the main turn goes on
+        payload["session_id"] = root
+        # A sub-agent that agy has not listed yet: while the tab works, keep its main conversation.
+        main = agents.agy_root(prev["agent_session"], tree)[0] if prev.get("agent_session") else None
+        if (prev.get("agent") == "agy" and prev.get("state") == states.WORKING and main
+                and root != main and root not in tree):
+            if payload.get("hook_event_name") in ("Stop", "SessionStart"):
+                return
+            payload["session_id"] = main
     record = {"iterm": uuid, "agent": agent, "state": state, "detail": detail,
               "event": payload.get("hook_event_name"), "ts": now,
               "agent_session": payload.get("session_id"), "cwd": payload.get("cwd") or prev.get("cwd")}
