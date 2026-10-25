@@ -487,12 +487,36 @@ async def remote_tag(session, remote_tabs):
     return remote_tabs[session.session_id]
 
 
+async def attached_tab(app, host, tmux_session):
+    """The local tab whose ssh is the connection of a tmux client of this session on the host
+    (any tab, also one the person opened), or None. See remote.match_tab."""
+    clients = await asyncio.to_thread(host.clients)
+    if not any(c[0] == tmux_session for c in clients):
+        return None
+    ttys = {}
+    for w in app.terminal_windows:
+        for t in w.tabs:
+            for s in t.sessions:
+                try:
+                    ttys[s] = await s.async_get_variable("tty")
+                except Exception:  # noqa: BLE001 - a closed session
+                    pass
+    local = await asyncio.to_thread(remote.local_ssh_ends, set(ttys.values()))
+    tty = remote.match_tab(clients, local, tmux_session)
+    return next((s for s, t in ttys.items() if tty and t == tty), None)
+
+
 async def raise_remote(app, host, row, remote_tabs):
-    """A click on a remote row. The local tab opened before for that host and tmux session: select
-    the row's window and pane there (tmux), or attach again if the connection ended. Else a new
-    tab in the front window that runs the host's "attach" command."""
+    """A click on a remote row. A local tab already attached to that host and tmux session (found
+    by its ssh connection, or opened here before): select the row's window and pane there (tmux),
+    or attach again if the connection ended. Else a new tab in the front window that runs the
+    host's "attach" command."""
     tag = f"{host.name}:{row['tmux_session']}"
-    target = None
+    target = await attached_tab(app, host, row["tmux_session"])
+    if target is not None:  # a tab the person attached in: tag it, so focus on it counts as seen
+        if await remote_tag(target, remote_tabs) != tag:
+            await target.async_set_variable(REMOTE_VAR, tag)
+            remote_tabs[target.session_id] = tag
     for w in app.terminal_windows:
         for t in w.tabs:
             for s in t.sessions:

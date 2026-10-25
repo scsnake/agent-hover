@@ -151,3 +151,48 @@ def test_split_sid():
     assert remote.split_sid("gpu:tmux-1-4") == ("gpu", "tmux-1-4")
     assert remote.split_sid("243CB74F-A646-4BFE-A2AB-E462597C654F") is None
     assert remote.split_sid("gpu:../x") is None
+
+
+def test_clients_and_local_ssh_ends(monkeypatch):
+    out = "\n".join(["2258093|~|a", "1852973|~|claude bot", "77|~|local", "88|~|old", f"{remote.MARK} ssh",
+                     "2258093 10326 SSH_CONNECTION=192.0.2.10 56549 198.51.100.20 22",
+                     "1852973 14628 SSH_CONNECTION=fe80::1 64759 fe80::2 22", "77  ",
+                     "88  SSH_CONNECTION=10.0.0.1 5000 10.0.0.2 22"])
+    assert remote.parse_clients(out) == [("a", "192.0.2.10", 56549, 10326.0),
+                                         ("claude bot", "fe80::1", 64759, 14628.0), ("old", "10.0.0.1", 5000, None)]
+    assert [remote.elapsed_s(x) for x in ("02:52:08", "04:03", "1-00:00:01", "x", "1:2:3:4")] == [
+        10328.0, 243.0, 86401.0, None, None]
+
+    class R:
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "ps":
+            return R("52680 02:52:08 ttys000 ssh\n52569 02:52:09 ttys000 -zsh\n60000 04:03:49 ttys009 /usr/bin/ssh\n"
+                     "61000 04:25:40 ?? ssh: /Users/me/.ssh/cp-d890 [mux]\n62000 01:00 ttys012 ssh\n")
+        assert cmd[cmd.index("-p") + 1] == "52680,60000,61000,62000"
+        return R("p52680\nf4\ntIPv4\nd0x30\nn192.0.2.10:56549->198.51.100.20:22\n"
+                 "p60000\nf3\ntunix\nd0xcc\nn->0xe8\n"  # a ControlMaster client: no TCP of its own
+                 "p61000\nf4\ntIPv6\nd0x39\nn[fe80::1]:64759->[fe80::2]:22\nf10\ntunix\nd0xe8\nn/Users/me/.ssh/cp-d890\n"
+                 "p62000\nf3\ntunix\nd0xdd\nn->0xff\n")  # its master is gone
+
+    monkeypatch.setattr(remote.subprocess, "run", fake_run)
+    assert remote.local_ssh_ends({"/dev/ttys000", "/dev/ttys009", "/dev/ttys012"}) == {
+        "/dev/ttys000": {("192.0.2.10", 56549): 10328.0}, "/dev/ttys009": {("fe80::1", 64759): 14629.0}}
+
+
+def test_match_tab():
+    master = ("10.0.0.1", 64759)
+    clients = [("a", "10.0.0.1", 56549, 10326.0), ("bot", *master, 14628.0), ("c", *master, 300.0)]
+    local = {"/dev/ttys000": {("10.0.0.1", 56549): 10328.0},
+             "/dev/ttys009": {master: 14629.0}, "/dev/ttys010": {master: 301.0}, "/dev/ttys011": {master: 50.0}}
+    assert remote.match_tab(clients, local, "a") == "/dev/ttys000"
+    # Three tabs share one ControlMaster connection: the ages tell which one runs which client.
+    assert remote.match_tab(clients, local, "bot") == "/dev/ttys009"
+    assert remote.match_tab(clients, local, "c") == "/dev/ttys010"
+    assert remote.match_tab(clients, local, "none") is None
+    # One tab on the connection, one client: no age needed. Two tabs, no age: no guess.
+    assert remote.match_tab([("bot", *master, None)], {"/dev/ttys009": {master: 1.0}}, "bot") == "/dev/ttys009"
+    assert remote.match_tab([("bot", *master, None)], local, "bot") is None
+    assert remote.match_tab([("bot", *master, 9000.0)], local, "bot") is None  # no tab that old

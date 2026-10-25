@@ -4,8 +4,10 @@ Read-only, nothing to install: each interval the daemon runs one shell script on
 (through the "connect" command) that only reads. It lists the tmux panes, runs ps, reads Claude
 Code's own status files (~/.claude/sessions/<pid>.json) and the end of each running Codex
 session file. `python -m agent_hover.remote script` prints the exact script. Only a click on a
-remote row changes something: it opens a local iTerm2 tab with the "attach" command, or, in
-the tab it opened before, selects the row's tmux window and pane.
+remote row changes something: in a local iTerm2 tab already attached to that tmux session, it
+selects the row's tmux window and pane; else it opens a tab with the "attach" command. A tab
+the person attached by hand is found when its ssh connection is the one a tmux client of that
+session came in on (SSH_CONNECTION, Linux hosts).
 
 config.json (no "remote" hosts: nothing connects):
   "remote": {"hosts": [
@@ -61,6 +63,26 @@ CODEX_PART = r"""for p in $(ps -A -o pid=,args= | awk '{a=$2; sub(".*/","",a); b
   done
 done"""
 
+# The tmux clients and the ssh connection each one came in on: its SSH_CONNECTION
+# ("client-ip client-port server-ip server-port", from /proc, so Linux only), and the age in
+# seconds of its ssh session (the process under sshd). A local tab whose own ssh has that
+# address and port is the tab of that client; tabs that share one ControlMaster also share its
+# connection, and then the age tells them apart.
+CLIENTS_SCRIPT = r"""tmux list-clients -F '#{client_pid}|~|#{client_session}' 2>/dev/null
+echo @@section ssh
+for p in $(tmux list-clients -F '#{client_pid}' 2>/dev/null); do
+  [ -r /proc/$p/environ ] || continue
+  q=$p
+  while :; do
+    pp=$(ps -o ppid= -p $q | tr -d ' ')
+    { [ -z "$pp" ] || [ "$pp" -le 1 ]; } && break
+    case "$(ps -o comm= -p $pp)" in sshd*) break;; esac
+    q=$pp
+  done
+  echo "$p $(ps -o etimes= -p $q | tr -d ' ') $(tr '\0' '\n' < /proc/$p/environ | grep '^SSH_CONNECTION=')"
+done"""
+AGE_SLACK_S = 10.0  # a local ssh and the remote session it started: ages this close
+
 
 def tmux_key(server_pid, pane_id):
     """'tmux-<server pid>-<pane number>' for pane '%4'. Pane numbers start again when the tmux
@@ -74,6 +96,109 @@ def split_sid(sid):
     """'gpu-box:tmux-4012-4' -> ('gpu-box', 'tmux-4012-4'); None for a local session."""
     host, _, key = str(sid).partition(":")
     return (host, key) if NAME_RE.fullmatch(host) and KEY_RE.fullmatch(key) else None
+
+
+def parse_clients(text):
+    """[(tmux session, client ip, client port, session age in s or None)] of the clients that
+    came in over ssh."""
+    sessions, conns, part = {}, {}, "clients"
+    for line in text.splitlines():
+        if line == f"{MARK} ssh":
+            part = "ssh"
+        elif part == "clients" and SEP in line:
+            pid, session = line.split(SEP, 1)
+            sessions[pid] = session
+        elif part == "ssh":
+            m = re.fullmatch(r"(\d+) +(\d+)? *SSH_CONNECTION=(\S+) (\d+) \S+ \d+", line.strip())
+            if m:
+                conns[m[1]] = (m[3], int(m[4]), float(m[2]) if m[2] else None)
+    return [(sessions[pid], *conns[pid]) for pid in sessions if pid in conns]
+
+
+def elapsed_s(text):
+    """Seconds of a ps etime value, [[dd-]hh:]mm:ss, or None."""
+    days, _, rest = text.strip().rpartition("-")
+    parts = rest.split(":")
+    if not (1 < len(parts) < 4 and all(x.isdigit() for x in parts) and (not days or days.isdigit())):
+        return None
+    secs = 0
+    for x in parts:
+        secs = secs * 60 + int(x)
+    return float(secs + int(days or 0) * 86400)
+
+
+def local_ssh_ends(ttys):
+    """{tty: {(local ip, local port): age in s}} of the ssh processes on these ttys ("/dev/ttys003"):
+    the TCP connection each one has, or, for one that goes through a ControlMaster (a unix
+    socket to the master process), the master's."""
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid=,etime=,tty=,comm="], capture_output=True, text=True,
+                            timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    ssh, tabs = [], {}
+    for line in ps.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and Path(parts[3].split()[0].rstrip(":")).name == "ssh":  # a master: "ssh: /path [mux]"
+            ssh.append(parts[0])
+            if f"/dev/{parts[2]}" in ttys:
+                tabs[parts[0]] = (f"/dev/{parts[2]}", elapsed_s(parts[1]))
+    if not tabs:
+        return {}
+    try:
+        out = subprocess.run(["lsof", "-nP", "-p", ",".join(ssh), "-Fptdn"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    tcp, peers, owner = {}, {}, {}  # pid -> {(ip, port)}; pid -> {peer socket}; socket -> pid
+    pid = kind = dev = None
+    for line in out.splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p":
+            pid = value
+        elif tag == "f":
+            kind = dev = None
+        elif tag == "t":
+            kind = value
+        elif tag == "d":
+            dev = value
+        elif tag == "n" and kind in ("IPv4", "IPv6") and "->" in value:
+            ip, _, port = value.split("->")[0].rpartition(":")
+            if port.isdigit():
+                tcp.setdefault(pid, set()).add((ip.strip("[]"), int(port)))
+        elif tag == "n" and kind == "unix":
+            if dev:
+                owner[dev] = pid
+            if value.startswith("->"):
+                peers.setdefault(pid, set()).add(value[2:])
+    ends = {}
+    for pid, (tty, age) in tabs.items():
+        found = set(tcp.get(pid, ()))
+        for peer in peers.get(pid, ()):
+            if owner.get(peer) not in (None, pid):
+                found |= tcp.get(owner[peer], set())
+        for end in found:
+            ends.setdefault(tty, {})[end] = age
+    return ends
+
+
+def match_tab(clients, local, tmux_session):
+    """The tty of the local tab where a tmux client of this session runs, or None. A client
+    matches the tab whose ssh has the client's connection. When several tabs (one ControlMaster)
+    or several clients share that connection: the tab whose ssh age is closest to the age of the
+    client's ssh session, within AGE_SLACK_S."""
+    for session, ip, port, age in clients:
+        if session != tmux_session:
+            continue
+        end = (ip, port)
+        tabs = {tty: ends[end] for tty, ends in local.items() if end in ends}
+        if len(tabs) == 1 and sum((c[1], c[2]) == end for c in clients) == 1:
+            return next(iter(tabs))
+        near = [(abs(a - age), tty) for tty, a in tabs.items()
+                if age is not None and a is not None and abs(a - age) <= AGE_SLACK_S]
+        if near:
+            return min(near)[1]
+    return None
 
 
 def collect_script(models=()):
@@ -385,6 +510,11 @@ class Host:
             command = f"tmux select-window -t {pane} \\; select-pane -t {pane}"
             self.log("remote_command", host=self.name, command=command)
             self.run(command, timeout=10)
+
+    def clients(self):
+        """The host's tmux clients now (see parse_clients)."""
+        code, out = self.run(CLIENTS_SCRIPT, timeout=10)
+        return parse_clients(out) if code == 0 else []
 
     def attach_command(self, row):
         """The attach command for one row, or None (no "attach" for a non-ssh connect)."""

@@ -176,7 +176,7 @@
 - `~/.claude/sessions/*.json`：Claude Code 為每個執行中 session 寫的狀態檔（busy、idle 或 waiting；資料夾；tmux 窗格）。
 - 每個執行中 Codex session 檔（`~/.codex/sessions`）的最後 64 KB，以及每分鐘一次各代理對話紀錄中的模型名稱。
 
-懸停預覽執行 `tmux capture-pane -p`。只有點擊會改變東西：開一個執行 `attach` 的本機分頁；或在之前開過的分頁裡，選取該列的 tmux 視窗與窗格（`tmux select-window`、`select-pane`）。背景程式的紀錄（`./run.sh log`）會記下啟動時的腳本，以及每次 peek 與 select 指令。
+懸停預覽執行 `tmux capture-pane -p`。只有點擊會改變東西。若已有本機分頁連到該 tmux session，就在那裡選取該列的 tmux 視窗與窗格（`tmux select-window`、`select-pane`）；否則開一個執行 `attach` 的本機分頁。你自己連上的分頁，依 ssh 連線找出：背景程式執行 `tmux list-clients`，讀取每個 client 的 `SSH_CONNECTION`（Linux 主機），再與本機 ssh 的連接埠（`lsof`）比對。經由 ControlMaster 的 ssh 分頁，使用 master 的連線。多個分頁共用同一條連線時，選 ssh 啟動時間與遠端 ssh session 相同的那個分頁。背景程式的紀錄（`./run.sh log`）會記下啟動時的腳本，以及每次 peek 與 select 指令。
 
 **共用一條連線：** 對 ssh 的 `connect`，背景程式會加上 `BatchMode=yes`（不詢問密碼）、`ConnectTimeout=5`、`Compression=yes` 與共用連線（`ControlMaster=auto`、`ControlPersist=120`，控制 socket 放在 `~/.agent-hover/`）。只有你的指令沒設定該選項時才會加。第一次掃描登入一次；之後的掃描都重用這條連線（約 0.1 秒，而不是 1–2 秒）。這是 OpenSSH 用戶端的功能，伺服器不需要任何改動。Windows 的 OpenSSH 不支援：請設 `"share_connection": false`。
 
