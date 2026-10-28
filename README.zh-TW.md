@@ -238,6 +238,7 @@
 - 對還沒有 hook 事件的代理分頁，背景程式會讀取 Claude Code 自己的程序檔（`~/.claude/sessions/<pid>.json`），取得對話 ID、資料夾與狀態。它也會讀取程序清單（`ps`）來計算 CPU 與記憶體。
 - Claude Code 會透過 hook 回報自己的用量上限：一輪因用量上限或帳號問題停止（`StopFailure`），或上限在 Mac 睡眠時重置（`quota_auto_resume_stale`），都會顯示為**等待中**，並附上 Claude 的訊息。
 - 對工作中的 Codex 分頁，背景程式每 5 秒讀取其對話紀錄檔（`~/.codex/sessions`）的結尾。Codex 在一輪因錯誤結束時不會送出 hook，所以要靠這個方法，把用量上限的停止顯示為**等待中**（Codex 接著會詢問是否改用較小的模型）。還沒有 hook 事件的 Codex 分頁，會透過其程序開啟的檔案（`lsof`）對應到它的對話紀錄檔。
+- 較新的 Codex 版本在 `codex app-server` 背景程式中執行 hook，而不是在分頁裡的 `codex` 底下。該背景程式保留啟動它的那個分頁的環境，所以 `$ITERM_SESSION_ID` 指向錯誤的分頁。hook 會看出其父程序是 `codex app-server`，改用對話 ID 找分頁（紀錄中有該 ID 的已開啟 Codex 分頁），否則依資料夾找：同一資料夾的已開啟 Codex 分頁，優先選還沒有對話的分頁。同一資料夾有兩個新的 Codex 分頁時，略過該事件（不猜測），並在 `events.jsonl` 記為 `unrouted`。
 - 偷看功能透過 iTerm2 讀取滑鼠所指分頁的畫面，並把最後幾行存在 `~/.agent-hover/peek.json`。
 
 ## 運作方式

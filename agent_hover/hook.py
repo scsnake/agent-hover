@@ -41,6 +41,16 @@ def waiting_question(uuid, payload):
     return question
 
 
+def from_app_server():
+    """True when this hook runs under `codex app-server` (not under the codex in a tab)."""
+    from agent_hover import commands
+    for pid in commands.parent_pids(os.getppid(), depth=4):
+        argv = commands.process_argv(pid) or []
+        if argv and Path(argv[0]).name == "codex" and "app-server" in argv[1:3]:
+            return True
+    return False
+
+
 def main():
     agent = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     try:
@@ -57,10 +67,18 @@ def main():
             pass
     if agent == "agy":
         payload = states.agy_payload(sys.argv[2] if len(sys.argv) > 2 else "", payload)
-    # A background job has no tab environment: find its tab through the session ID.
-    uuid = states.iterm_session_uuid() or (None if agent == "agy" else states.tab_for_session(
-        payload.get("session_id"), payload.get("transcript_path")))
+    if agent == "codex" and from_app_server():
+        # Codex can run its hooks in its app-server daemon: its environment is the one of the tab
+        # that started the daemon, so find the tab through the session ID or the folder instead.
+        uuid = states.codex_tab(payload.get("session_id"), payload.get("cwd"))
+    else:
+        # A background job has no tab environment: find its tab through the session ID.
+        uuid = states.iterm_session_uuid() or (None if agent == "agy" else states.tab_for_session(
+            payload.get("session_id"), payload.get("transcript_path")))
     if not uuid:
+        if agent == "codex":
+            states.append_log("events.jsonl", {"ts": time.time(), "agent": agent, "event": payload.get("hook_event_name"),
+                                               "session": payload.get("session_id"), "unrouted": True})
         return
     mapped = states.map_event(agent, payload)
     nested = states.nested_run(agent, payload)

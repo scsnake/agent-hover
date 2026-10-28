@@ -367,6 +367,32 @@ def tab_for_session(session_id, transcript_path=None):
     return None
 
 
+def codex_tab(session_id, cwd, max_age_s=120):
+    """The open Codex tab (a row of panel.json) of a Codex session, or None: the tab that names
+    the session, else the one in this folder (a tab with no session yet first; two such tabs:
+    None, no guess). For hooks that run without the tab's environment."""
+    try:
+        panel = json.loads((HOME / "panel.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(panel, dict) or time.time() - panel.get("ts", 0) > max_age_s:
+        return None
+    tabs = [r for r in panel.get("rows", []) if isinstance(r, dict) and r.get("agent") == "codex"
+            and not r.get("host") and UUID_RE.fullmatch(str(r.get("session")))]
+    known = {r["session"]: (read_state(r["session"]) or {}).get("agent_session") for r in tabs}
+    named = [t for t, sid in known.items() if session_id and sid == session_id]
+    if named:
+        return named[0]
+    if not cwd:
+        return None
+    where = os.path.realpath(cwd)
+    here = [r["session"] for r in tabs if r.get("cwd") and os.path.realpath(r["cwd"]) == where]
+    new = [t for t in here if not known[t]]
+    if len(new) == 1:
+        return new[0]
+    return here[0] if len(here) == 1 else None
+
+
 def state_path(uuid):
     return STATE_DIR / f"{uuid}.json"
 

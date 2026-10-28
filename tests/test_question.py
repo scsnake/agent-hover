@@ -70,3 +70,42 @@ def test_late_post_tool_use_keeps_done(monkeypatch, tmp_path):
     assert send("PostToolUse") == "idle"
     assert send("PermissionRequest") == "waiting"
     assert send("PostToolUse") == "working"  # approved: the turn goes on
+
+
+def test_codex_app_server_hooks_find_the_tab(monkeypatch, tmp_path):
+    import io
+    import json
+    import time
+    monkeypatch.setattr(states, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(states, "LOG_DIR", tmp_path / "log")
+    monkeypatch.setattr(states, "HOME", tmp_path)
+    a, b, c, wrong = ("A" * 8 + "-1111-1111-1111-" + "1" * 12, "B" * 8 + "-2222-2222-2222-" + "2" * 12,
+                      "C" * 8 + "-3333-3333-3333-" + "3" * 12, "D" * 8 + "-4444-4444-4444-" + "4" * 12)
+    old = "01a18029-0fa9-72f0-90e9-67fadc24a1b5"
+    rows = [{"session": a, "agent": "codex", "cwd": "/w"}, {"session": b, "agent": "codex", "cwd": "/w"},
+            {"session": c, "agent": "codex", "cwd": "/other"}, {"session": "gpu:tmux-1-4", "agent": "codex",
+                                                                 "cwd": "/w", "host": "gpu"}]
+    (tmp_path / "panel.json").write_text(json.dumps({"ts": time.time(), "rows": rows}))
+    states.write_state(a, {"agent": "codex", "state": "idle", "agent_session": old})
+    states.write_state(b, {"agent": "codex", "state": "idle", "agent_session": None})
+    assert states.codex_tab(old, "/w") == a           # the tab that names the session
+    assert states.codex_tab("new", "/w") == b         # same folder: the tab with no session yet
+    assert states.codex_tab("new", "/other") == c     # the only tab in that folder
+    assert states.codex_tab("new", "/none") is None
+    states.write_state(a, {"agent": "codex", "state": "idle", "agent_session": None})
+    assert states.codex_tab("new", "/w") is None      # two new tabs in one folder: no guess
+
+    # The hook under the app-server: its $ITERM_SESSION_ID is the tab that started the daemon.
+    states.write_state(a, {"agent": "codex", "state": "idle", "agent_session": old})
+    monkeypatch.setenv("ITERM_SESSION_ID", f"w0t0p0:{wrong}")
+    monkeypatch.setattr(hook, "from_app_server", lambda: True)
+    monkeypatch.setattr(hook, "set_iterm_status", lambda uuid, state: None)
+    monkeypatch.setattr(hook.sys, "argv", ["hook.py", "codex"])
+    new = "01a18030-0000-7000-8000-000000000001"
+    for event, sid in (("UserPromptSubmit", old), ("SessionStart", new), ("UserPromptSubmit", new)):
+        monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(
+            {"hook_event_name": event, "session_id": sid, "cwd": "/w", "prompt": "x"})))
+        hook.main()
+    assert states.read_state(a)["agent_session"] == old and states.read_state(a)["state"] == "working"
+    assert states.read_state(b)["agent_session"] == new and states.read_state(b)["state"] == "working"
+    assert states.read_state(wrong) is None
