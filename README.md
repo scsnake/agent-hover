@@ -23,7 +23,8 @@ Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs
 | Peek | Hover any other row to see the last lines of that tab's screen, without switching to it |
 | CPU and memory | Hover the agent mark at the right end of a row: the frame shows the agent, model, CPU and memory (instead of the screen) of the agent and the commands it runs. A red flame marks an agent that is not working but uses much CPU (stuck, or a command still running) |
 | "New" dot | A blue dot marks a done tab that you have not looked at yet |
-| Pin | Right-click a row → **Pin**. A pinned tab is never hidden and is listed first |
+| Pin | Hover a row and click the pin icon at its end (or right-click → **Pin**). A pinned tab is never hidden and is listed first |
+| Hide now | Hover a row and click the eye-slash icon (or right-click → **Hide now**). The tab is hidden at once, also the tab you use. It comes back when its state changes (it waits for you, or ends its turn), or when you click its row. Hiding a pinned tab unpins it. Not in dry run |
 | Search | Click the magnifier. Filter by tab name and agent folder, and optionally by chat text. Agents closed in the last 7 days show under **Closed**; a click opens a new tab in that folder with the resume command typed (press Enter to run it) |
 | Edge bar | Drag the pill against the right edge of the screen, push a little past it and hold for a moment (a blue border appears), then release. It becomes a thin bar in the color of the most urgent state. Hover it to see the panel; drag it away from the edge to undock |
 | Model | Hover a row to see the agent and its model (also a custom provider, for example Codex with a local model) |
@@ -83,7 +84,8 @@ Start the daemon from a plain shell tab, not from inside an agent session.
 | Click a row, or the pill | That tab comes back (if buried), is selected, and iTerm2 comes to the front |
 | Hover a waiting row | A frame beside the list shows the agent's question |
 | Hover any other row | After 0.35 s, a frame shows the last lines of that tab's screen (Peek) |
-| Right-click a row | **Pin** / **Unpin** |
+| Hover a row | Pin icon: **Pin** / **Unpin**. Eye-slash icon: **Hide now** (local visible tabs) |
+| Right-click a row | **Pin** / **Unpin**, **Hide now** |
 | Click the magnifier | Search mode: type to filter. Turn on **chat** to search the chat text. **Enter** raises the first tab; **Esc** ends the search |
 | Drag the pill | Move the panel. Drop it at the right screen edge to get the edge bar |
 
@@ -98,7 +100,7 @@ The daemon checks once per second.
 - **Comes back:** the agent **waits** for you, or is **done** and you did not look at it yet. Also when its agent ends.
 - **Hidden:** a **done** (seen) or **idle** tab after 20 min. A **working** tab is hidden only by the N limit below (set `daemon.working_park_s` to also hide it that many seconds after you leave it).
 - **Too many tabs:** when more than N (5) agent tabs are visible, idle tabs go first, then done, then working.
-- **Never hidden:** the tab you use, the selected tab of each window, waiting tabs, pinned tabs, the last tab of a window, tabs with split panes.
+- **Never hidden:** the tab you use, the selected tab of each window, waiting tabs, pinned tabs, the last tab of a window, tabs with split panes. **Hide now** overrides the first two.
 - **No surprises while you type:** an automatic unbury waits until no key was pressed for 3 s. Afterwards, the window you typed in gets the keyboard back.
 
 Agent tabs that started before the install are found by their job name (`claude`, `codex`) within 5 s.
@@ -172,10 +174,11 @@ Agents that run in tmux on another machine (for example a GPU server) can show i
 **What runs on the host:** every `interval_s` seconds, the daemon runs one read-only shell script through `connect`. `./run.sh remote script` prints it. It only reads:
 
 - `tmux list-panes`: the panes, their windows and titles.
-- `ps`: which panes run `claude` or `codex`, and their CPU and memory. Only the first two words of each command line are sent.
+- `ps`: which panes run `claude`, `codex` or `agy`, and their CPU and memory. Only the first two words of each command line are sent.
 - `~/.claude/sessions/*.json`: Claude Code's own status file of each running session (busy, idle or waiting; folder; tmux pane).
 - The last 64 KB of each running Codex session file (`~/.codex/sessions`), and once a minute the model line of each agent's transcript.
-- `tmux capture-pane -p`: the last 30 non-empty screen lines of each Codex pane. Codex writes nothing to its files while it waits for an approval. When the pane title is "Action Required", or the bottom lines show an approval, question, trust or update prompt, the row shows **waiting** with that prompt as the question. The prompt texts come from [herdr](https://github.com/herdrdev/herdr)'s Codex detection rules (Apache-2.0).
+- `tmux capture-pane -p`: the last 30 non-empty screen lines of each Codex and agy pane. Codex writes nothing to its files while it waits for an approval. When the pane title is "Action Required", or the bottom lines show an approval, question, trust or update prompt, the row shows **waiting** with that prompt as the question.
+- An agy row gets its whole state from the screen: a permission, question or trust dialog is **waiting**, the "esc to cancel" footer or a spinner is **working**, else **idle**. agy's terminal title is always "agi", so the row shows the folder name. The prompt texts come from [herdr](https://github.com/herdrdev/herdr)'s Codex and Antigravity detection rules (Apache-2.0).
 
 Hover Peek runs `tmux capture-pane -p`. Only a click changes something. If a local tab is already attached to that tmux session, it selects the row's tmux window and pane there (`tmux select-window`, `select-pane`). Else it opens a local tab that runs `attach`. A tab you attached yourself is found by its ssh connection: the daemon runs `tmux list-clients` and reads each client's `SSH_CONNECTION` (Linux hosts), then compares it with the local ssh ports (`lsof`). A tab whose ssh goes through a ControlMaster uses the master's connection. When several tabs share one connection, the tab whose ssh started at the same time as the remote ssh session is used. The daemon log (`./run.sh log`) records the script at start, and each peek and select command.
 

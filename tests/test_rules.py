@@ -131,3 +131,11 @@ def test_default_working_tab_parks_only_over_n():
     assert decide(busy, NOW, cfg, NOW - 60, {"w1": 99}).bury == []
     d = decide(busy + [tab("c", WORKING, age=5000, last_focus_ts=NOW - 100)], NOW, cfg, NOW - 60, {"w1": 99})
     assert d.bury == ["a"] and d.reasons["a"] == "park: over 2 active (working)"
+
+
+def test_hidden_tab_stays_buried():
+    # Hidden by hand: not raised although done and unseen, waiting (until the daemon ends the
+    # hide on a state change), or the selected tab.
+    d = run([tab("a", DONE, buried=True, hidden=True), tab("b", WAITING, buried=True, hidden=True),
+             tab("c", IDLE, buried=True, hidden=True, selected=True)])
+    assert d.unbury == []

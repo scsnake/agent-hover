@@ -216,7 +216,7 @@ def test_codex_prompt_on_screen_waits():
     screen = "\n".join([f"{m} screen %5", *APPROVAL])
     rows = remote.build_rows(remote.parse_output(out.replace(f"{m} end", screen + f"\n{m} end")), NOW)
     x = rows["tmux-2538-5"]
-    assert (x["state"], x["detail"], x["screen_wait"]) == (states.WAITING, "approve", True)
+    assert (x["state"], x["detail"], x["screen_state"]) == (states.WAITING, "approve", True)
     assert "rm -rf build" in x["question"] and "Press enter to confirm" in x["question"]
     # The same words far above the bottom (older output) do not count.
     old = "\n".join([f"{m} screen %5", *APPROVAL, *[f"line {i}" for i in range(25)]])
@@ -229,7 +229,7 @@ def test_codex_prompt_on_screen_waits():
     # A usage-limit stop stays as it is.
     limit = remote.build_rows(remote.parse_output(scan_output(codex_limit_tail()).replace(
         f"{m} end", screen + f"\n{m} end")), NOW)["tmux-2538-5"]
-    assert limit["detail"] == "usage limit" and not limit["screen_wait"]
+    assert limit["detail"] == "usage limit" and not limit["screen_state"]
 
 
 def test_screen_panes_in_script():
@@ -243,3 +243,67 @@ def test_codex_update_picker_waits():
     assert remote.codex_blocker("MacBookPro", picker)
     notice = ["│ ✨ Update available! 0.164.0 -> 0.165.0 │", "› Ask Codex to do anything", "  ? for shortcuts"]
     assert remote.codex_blocker("⠋ cxa", notice) is None
+
+
+AGY_PERMISSION = ["  Requesting permission for:", "  $ rm -rf build", "  > Allow once", "    Deny",
+                  "  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command", "  esc to cancel"]
+AGY_QUESTION = ["  Which database?", "  > Postgres", "    SQLite", "  ↑/↓ Navigate · enter Select · esc Skip",
+                "  esc to cancel"]
+AGY_WORKING = ["⠙ Reading the loader…", "╭──────────────────────╮", "│ >                    │",
+               "╰──────────────────────╯", "  ──────── esc to cancel"]
+AGY_IDLE = ["• Done: the loader reads gzip now.", "╭──────────────────────╮", "│ >                    │",
+            "╰──────────────────────╯", "  ? for shortcuts"]
+
+
+def agy_scan(screen=None):
+    m = remote.MARK
+    out = scan_output(codex_limit_tail())
+    out = out.replace(f"{m} ps\n", pane("2538", "%7", "a", "5", "230", "/data/agyproj", "agi") + f"\n{m} ps\n"
+                      + "230 1 0.0 4000 zsh -zsh\n500 230 3.0 120000 agy agy\n")
+    if screen is not None:
+        out = out.replace(f"{m} end", "\n".join([f"{m} screen %7", *screen, f"{m} end"]))
+    return remote.build_rows(remote.parse_output(out), NOW)["tmux-2538-7"]
+
+
+def test_agy_state_from_screen():
+    first = agy_scan()
+    assert (first["agent"], first["state"], first["name"]) == ("agy", states.IDLE, "agyproj")  # no screen yet
+    p = agy_scan(AGY_PERMISSION)
+    assert (p["state"], p["detail"], p["screen_state"]) == (states.WAITING, "approve", True)
+    assert "rm -rf build" in p["question"]
+    q = agy_scan(AGY_QUESTION)
+    assert (q["state"], q["detail"]) == (states.WAITING, "answer") and "Which database?" in q["question"]
+    trust = agy_scan(["  Do you trust the contents of this project?", "  > Yes, I trust this folder", "    No",
+                      "  ↑/↓ Navigate · enter Confirm"])
+    assert (trust["state"], trust["detail"]) == (states.WAITING, "trust")
+    w = agy_scan(AGY_WORKING)
+    assert (w["state"], w["question"]) == (states.WORKING, None)
+    assert agy_scan(["⠋ Thinking about the schema", *AGY_IDLE[1:4], "  · 1 task"])["state"] == states.WORKING
+    assert agy_scan(AGY_IDLE)["state"] == states.IDLE
+    # Old dialog text above the bottom rows does not count.
+    assert agy_scan([*AGY_QUESTION[:4], *AGY_IDLE])["state"] == states.IDLE
+
+
+def test_screen_state_since_kept(monkeypatch):
+    (h,) = remote.load_hosts({"remote": {"hosts": [{"name": "gpu", "connect": ["ssh", "gpu"]}]}})
+    outputs = []
+    monkeypatch.setattr(h, "run", lambda script, timeout=20.0: (0, outputs.pop(0)))
+    m = remote.MARK
+    base = scan_output(codex_working_tail())
+    with_screen = base.replace(f"{m} end", "\n".join([f"{m} screen %5", *APPROVAL, f"{m} end"]))
+    outputs[:] = [base, with_screen, with_screen, base]
+    h.scan(NOW)
+    assert h.rows["tmux-2538-5"]["state"] == states.WORKING
+    h.scan(NOW + 5)
+    assert h.rows["tmux-2538-5"]["since"] == NOW + 5
+    h.scan(NOW + 10)
+    assert h.rows["tmux-2538-5"]["since"] == NOW + 5  # still the same prompt
+    h.scan(NOW + 15)
+    assert h.rows["tmux-2538-5"]["state"] == states.WORKING
+    # Another prompt right after the first one: its own time.
+    other = base.replace(f"{m} end", "\n".join([f"{m} screen %5", *APPROVAL[:3], "  $ make clean", *APPROVAL[4:],
+                                                f"{m} end"]))
+    outputs[:] = [with_screen, other]
+    h.scan(NOW + 20)
+    h.scan(NOW + 25)
+    assert h.rows["tmux-2538-5"]["since"] == NOW + 25

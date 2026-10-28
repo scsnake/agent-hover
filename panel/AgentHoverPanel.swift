@@ -19,6 +19,8 @@
 // "Closed"; a click opens a new tab in its folder with the resume command typed (not run). Esc, a click outside or a click on a row ends it;
 // Enter raises the first row.
 // Click a row: ask the daemon to raise that tab (unbury, select, bring iTerm2 front).
+// Hover a row: a pin icon (pin / unpin) and an eye-slash icon (hide now: buried until its state
+// changes) at the end of the row; right-click shows the same as a menu.
 // Hotkey (panel.hotkey, default ctrl+opt+space): open the list in search mode from anywhere.
 // Stale tabs (done or idle for more than panel.fold_idle_h hours) fold into one line at the end.
 //
@@ -98,11 +100,12 @@ struct Row: Decodable {
     let detail: String?
     let since: Double
     let last: Double?  // time of the latest hook event (older daemons do not send it)
-    let buried: Bool
+    var buried: Bool
     let focused: Bool
     let question: String?  // what a waiting agent asks (older daemons do not send it)
     let cwd: String?       // the agent's folder (older daemons do not send it)
     var pinned: Bool?      // pinned in the panel: never parked, listed first
+    let hidden: Bool?      // hidden by hand in the panel: buried until its state changes
     let model: String?     // the model from the agent's transcript, e.g. "gpt-5.6-sol (openai)"
     let unseen: Bool?      // done, and the person has not looked at the tab since
     let cpu: Double?       // % CPU of the agent's process tree (agent, MCP servers, its commands)
@@ -397,6 +400,13 @@ func drawCentered(_ s: NSAttributedString, centerX: CGFloat, y: CGFloat) {
     s.draw(at: NSPoint(x: centerX - s.size().width / 2, y: y))
 }
 
+/// A row's hover icon (SF Symbol): pin, unpin or hide.
+func rowIcon(_ name: String, _ color: NSColor) -> NSImage? {
+    NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: fs(11), weight: .regular)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [color])))
+}
+
 /// The pin mark for pinned rows (SF Symbol, tinted).
 func pinIcon() -> NSImage? {
     NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "pinned")?
@@ -451,30 +461,52 @@ func flameIcon() -> NSImage? {
             .applying(NSImage.SymbolConfiguration(paletteColors: [.systemRed])))
 }
 
-/// One agent tab in the expanded list. Click raises it; right-click: pin or unpin.
+/// One agent tab in the expanded list. Click raises it. On hover, icons at the end of the row:
+/// pin / unpin, and hide (a visible local tab, apply mode). Right-click: the same as a menu.
 final class RowView: NSView {
     let row: Row
     let note: String?  // search mode: what matched (folder or chat line), after the name
     let onClick: (Row) -> Void
     var onPin: ((Row, Bool) -> Void)?
+    var onHide: ((Row) -> Void)?
+    var canHide = false
     var blinkOff = false  // the limit-over blink, off phase: the agent mark is not drawn
-    private var hover = false
 
     init(row: Row, frame: NSRect, note: String? = nil, onClick: @escaping (Row) -> Void) {
         self.row = row
         self.note = note
         self.onClick = onClick
         super.init(frame: frame)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                       owner: self, userInfo: nil))
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways,
+                                                              .inVisibleRect], owner: self, userInfo: nil))
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseEntered(with event: NSEvent) { hover = true; needsDisplay = true }
-    override func mouseExited(with event: NSEvent) { hover = false; needsDisplay = true }
-    override func mouseDown(with event: NSEvent) { onClick(row) }
+    override func mouseEntered(with event: NSEvent) { needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { needsDisplay = true }
+    override func mouseMoved(with event: NSEvent) { needsDisplay = true }  // the icon under the cursor
+
+    /// The cursor in this view, or nil. Read at draw time: the rows are rebuilt each second, and
+    /// a new view gets no mouseEntered for a cursor that is already on it.
+    private var cursor: NSPoint? {
+        guard let w = window else { return nil }
+        let p = convert(w.mouseLocationOutsideOfEventStream, from: nil)
+        return bounds.contains(p) ? p : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let icons = iconRects()
+        if icons.pin.contains(p) {
+            togglePin()
+        } else if let hide = icons.hide, hide.contains(p) {
+            onHide?(row)
+        } else {
+            onClick(row)
+        }
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {  // right-click or control-click
         let pinned = row.pinned == true
@@ -484,12 +516,38 @@ final class RowView: NSView {
         item.target = self
         item.image = NSImage(systemSymbolName: pinned ? "pin.slash" : "pin", accessibilityDescription: nil)
         m.addItem(item)
+        if canHide {
+            let hide = NSMenuItem(title: "Hide now (until it waits or ends its turn)", action: #selector(hideNow),
+                                  keyEquivalent: "")
+            hide.target = self
+            hide.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: nil)
+            m.addItem(hide)
+        }
         return m
     }
 
     @objc func togglePin() { onPin?(row, row.pinned != true) }
+    @objc func hideNow() { onHide?(row) }
+
+    /// Width of the marks at the right end: age, agent mark, and the flame and host icons.
+    private func rightWidth() -> CGFloat {
+        var w = ageColumnW + 6 + markColumnW
+        if row.hot == true, let flame = flameIcon() { w += flame.size.width + 4 }
+        if row.host != nil, let icon = hostIcon() { w += icon.size.width + 4 }
+        return w
+    }
+
+    /// The hover icons, left of the right-end marks: pin, then hide.
+    private func iconRects() -> (pin: NSRect, hide: NSRect?) {
+        let w = fs(20)
+        let right = bounds.width - pad - rightWidth() - 2
+        let hide = canHide ? NSRect(x: right - w, y: 0, width: w, height: bounds.height) : nil
+        return (NSRect(x: right - w * (canHide ? 2 : 1), y: 0, width: w, height: bounds.height), hide)
+    }
 
     override func draw(_ dirtyRect: NSRect) {
+        let cursor = self.cursor
+        let hover = cursor != nil
         if hover {
             NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).setFill()
             NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
@@ -502,6 +560,9 @@ final class RowView: NSView {
             NSColor.systemBlue.setFill()
             let d = fs(7)
             NSBezierPath(ovalIn: NSRect(x: pad, y: (bounds.height - d) / 2, width: d, height: d)).fill()
+        } else if row.hidden == true && row.buried, let eye = rowIcon("eye.slash", infoColor) {  // hidden by hand
+            eye.draw(in: NSRect(x: pad - 2, y: (bounds.height - eye.size.height) / 2, width: eye.size.width,
+                                height: eye.size.height))
         } else {
             text(row.buried ? "▾" : (row.focused ? "▸" : " "), infoColor).draw(at: NSPoint(x: pad, y: y))
         }
@@ -529,7 +590,25 @@ final class RowView: NSView {
         if let d = row.detail, !d.isEmpty, row.state == "waiting", row.resets_at == nil {
             label += "  — \(d)"  // a usage limit shows on the agent mark's frame instead (rowInfo)
         }
-        let nameRect = NSRect(x: pad + fs(32), y: y, width: bounds.width - rightW - pad * 2 - fs(40), height: fs(16))
+        var nameW = bounds.width - rightW - pad * 2 - fs(40)
+        if let c = cursor {  // the hover icons take the end of the name's space
+            let icons = iconRects()
+            nameW = min(nameW, icons.pin.minX - pad - fs(32) - 2)
+            let items: [(NSRect, String)] = [(icons.pin, row.pinned == true ? "pin.slash" : "pin")]
+                + (icons.hide.map { [($0, "eye.slash")] } ?? [])
+            for (r, symbol) in items {
+                let on = r.contains(c)
+                if on {
+                    NSColor.labelColor.withAlphaComponent(0.12).setFill()
+                    NSBezierPath(roundedRect: r.insetBy(dx: 1, dy: 2), xRadius: 4, yRadius: 4).fill()
+                }
+                if let img = rowIcon(symbol, on ? .labelColor : .secondaryLabelColor) {
+                    img.draw(in: NSRect(x: r.midX - img.size.width / 2, y: (bounds.height - img.size.height) / 2,
+                                        width: img.size.width, height: img.size.height))
+                }
+            }
+        }
+        let nameRect = NSRect(x: pad + fs(32), y: y, width: nameW, height: fs(16))
         let style = NSMutableParagraphStyle()
         style.lineBreakMode = .byTruncatingTail
         let s = NSMutableAttributedString(string: label, attributes: [
@@ -696,6 +775,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     var pillRow: Row?  // the tab the pill shows; a click on the pill raises it
     // A pin or unpin shows at once: kept here until panel.json agrees (or 5 s pass).
     var pendingPins: [String: (on: Bool, since: Date)] = [:]
+    var pendingHides: [String: Date] = [:]  // a hide shows at once (row buried) until panel.json agrees
     // Question preview: a second small panel beside the list, for the waiting row under the mouse.
     let preview = Panel(contentRect: .zero, styleMask: [.nonactivatingPanel, .borderless],
                         backing: .buffered, defer: true)
@@ -1539,6 +1619,8 @@ final class Controller: NSObject, NSSearchFieldDelegate {
                 [weak self] row in self?.raise(row)
             }
             v.onPin = { [weak self] row, on in self?.setPin(row, on) }
+            v.onHide = { [weak self] row in self?.hide(row) }
+            v.canHide = r.host == nil && !r.buried && snapshot?.apply == true
             v.blinkOff = blinking.contains(r.session) && !blinkPhase  // rows are rebuilt each second
             listView.addSubview(v)
             rowViews.append(v)
@@ -1627,15 +1709,27 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         layout()
     }
 
-    /// The daemon's rows with the pins not yet in panel.json applied.
+    /// Hide a tab now (the row's eye icon): the daemon buries it until its state changes.
+    func hide(_ row: Row) {
+        sendRequest("hide", row.session)
+        pendingHides[row.session] = Date()
+        pendingPins.removeValue(forKey: row.session)
+        layout()
+    }
+
+    /// The daemon's rows with the pins and hides not yet in panel.json applied.
     func rowsWithPendingPins(_ rows: [Row]) -> [Row] {
         pendingPins = pendingPins.filter { sid, p in
             Date().timeIntervalSince(p.since) < 5
                 && rows.first(where: { $0.session == sid }).map { ($0.pinned == true) != p.on } ?? false
         }
+        pendingHides = pendingHides.filter { sid, since in
+            Date().timeIntervalSince(since) < 5 && rows.first(where: { $0.session == sid }).map { !$0.buried } ?? false
+        }
         return rows.map { r in
             var r = r
             if let p = pendingPins[r.session] { r.pinned = p.on }
+            if pendingHides[r.session] != nil { r.buried = true; r.pinned = false }
             return r
         }
     }

@@ -146,3 +146,34 @@ def test_pin_and_unpin_requests(tmp_path, monkeypatch):
     (tmp_path / "requests" / "b.json").write_text(json.dumps({"action": "unpin", "session": "S"}))
     asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}))
     assert daemon.load_pins() == set()
+
+
+def test_hide_request(tmp_path, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(daemon, "REQUEST_DIR", tmp_path / "requests")
+    monkeypatch.setattr(daemon, "PINS_FILE", tmp_path / "pins.json")
+    monkeypatch.setattr(daemon.states, "read_state", lambda sid: {"state": "working"} if sid == "V" else None)
+    buried = []
+
+    async def fake_bury(app, sid, focus, ours, reason, by_hand=False):
+        buried.append((sid, reason, by_hand))
+        return True
+
+    monkeypatch.setattr(daemon, "bury", fake_bury)
+    (tmp_path / "requests").mkdir()
+    daemon.save_pins({"V"})
+    hidden = {}
+    (tmp_path / "requests" / "a.json").write_text(json.dumps({"action": "hide", "session": "V"}))
+    asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}, hidden=hidden, focus=object(), apply=True))
+    assert buried == [("V", "hide: by hand", True)] and hidden == {"V": "working"}
+    assert daemon.load_pins() == set()  # hiding ends the pin
+    # A pin shows it again.
+    (tmp_path / "requests" / "b.json").write_text(json.dumps({"action": "pin", "session": "V"}))
+    asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}, hidden=hidden, focus=object(), apply=True))
+    assert hidden == {}
+    # Dry run: nothing is hidden (nothing would raise it again). A buried tab: nothing to do.
+    for name, sid, apply in (("c", "V", False), ("d", "S", True)):
+        (tmp_path / "requests" / f"{name}.json").write_text(json.dumps({"action": "hide", "session": sid}))
+        asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}, hidden=hidden, focus=object(), apply=apply))
+    assert len(buried) == 1 and hidden == {}

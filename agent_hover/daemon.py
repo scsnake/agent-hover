@@ -345,8 +345,9 @@ async def unbury(app, sid, info, keep_selection=True):
     return True
 
 
-async def bury(app, sid, focus, ours, reason):
-    """Bury one session after a fresh check of layout and focus. Return True if buried."""
+async def bury(app, sid, focus, ours, reason, by_hand=False):
+    """Bury one session after a fresh check of layout and focus. Return True if buried. by_hand
+    (the panel's hide): also the focused tab and the selected tab of its window."""
     await app.async_refresh()
     await focus.refresh(app)
     where, counts = layout(app)
@@ -354,7 +355,8 @@ async def bury(app, sid, focus, ours, reason):
         return False
     win, tab, n_sessions, index = where[sid]
     selected = win.current_tab is not None and win.current_tab.tab_id == tab.tab_id
-    why_not = ("focused" if focus.has(sid) else "selected tab of its window" if selected
+    why_not = ("focused" if focus.has(sid) and not by_hand
+               else "selected tab of its window" if selected and not by_hand
                else "split tab" if n_sessions > 1
                else "last tab of its window" if counts.get(win.window_id, 0) <= 1 else None)
     if why_not:
@@ -395,16 +397,20 @@ def write_peek_lines(sid, lines):
     tmp.replace(PEEK_FILE)
 
 
-async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None):
+async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hidden=None, focus=None, apply=True):
     """Clicks from the hover panel: raise the tab (unbury if needed), select it and bring
     iTerm2 to the front. The click counts as a focus, not a pin: the normal rules apply
     from then on, so an idle tab is buried again after idle_park_s without focus.
     Works in dry run too: it is the person's own action.
-    "pin" / "unpin" (panel right-click): a pinned tab is never parked; the rules raise it
-    if it is buried.
+    "pin" / "unpin" (panel right-click or row icon): a pinned tab is never parked; the rules
+    raise it if it is buried.
+    "hide" (row icon or right-click): bury the tab now, also the focused or selected one. It
+    stays buried until its state changes (it waits, or ends its turn) or the person raises it.
+    Not in dry run: there nothing would raise it again.
     "resume" (a closed agent in the panel's search): see open_resume_tab.
     A remote row (session "host:tmux-..."): "peek" reads its tmux pane, "raise" see raise_remote."""
     buried_now = {x.session_id for x in app.buried_sessions}
+    hidden = {} if hidden is None else hidden
     for f in pending_requests():
         try:
             req = json.loads(f.read_text())
@@ -431,13 +437,28 @@ async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None):
             pins = load_pins()
             (pins.add if req["action"] == "pin" else pins.discard)(sid)
             save_pins(pins)
+            if req["action"] == "pin":
+                hidden.pop(sid, None)  # a pinned tab shows again
             log(req["action"], session=sid)
+            continue
+        if req.get("action") == "hide" and sid and not far:
+            rec = states.read_state(sid) or {}
+            ok = (apply and focus is not None and sid not in buried_now and bool(rec.get("state"))
+                  and await bury(app, sid, focus, ours, "hide: by hand", by_hand=True))
+            if ok:
+                hidden[sid] = rec["state"]
+                pins = load_pins()
+                if sid in pins:
+                    pins.discard(sid)  # hiding by hand ends a pin
+                    save_pins(pins)
+            log("hide", session=sid, ok=ok, **({} if apply else {"why": "dry run"}))
             continue
         if req.get("action") == "resume":
             await open_resume_tab(app, req)
             continue
         if req.get("action") != "raise" or not sid:
             continue
+        hidden.pop(sid, None)
         was_buried = sid in buried_now
         if was_buried:
             await unbury(app, sid, ours.pop(sid, {}), keep_selection=False)
@@ -612,6 +633,7 @@ async def run(conn, args):
 
     started = time.time()
     last_focus, pinned, last_sig = {}, {}, None
+    hidden = {}  # session -> its state when the person hid it (panel): buried until that changes
     deferring = False  # automatic unburies wait while the person types
     since = {}  # session -> (state, time the daemon first saw that state)
     names, names_ts = {}, 0.0
@@ -655,11 +677,19 @@ async def run(conn, args):
                 ours.pop(sid)
                 if sid in recs:
                     pinned[sid] = recs[sid].get("state")
+                hidden.pop(sid, None)
                 log("manual_unbury", session=sid)
         save_buried(ours)
         for sid in list(pinned):
             if recs.get(sid, {}).get("state") != pinned[sid]:
                 pinned.pop(sid)
+        for sid in list(hidden):
+            state = recs.get(sid, {}).get("state")
+            if state != hidden[sid]:
+                hidden.pop(sid)  # it waits, ends its turn, or starts work: show it by the rules
+                if state == states.IDLE:
+                    pinned[sid] = state  # a turn that ends in idle (seeded Claude, Codex abort): show it too
+                log("hide_end", session=sid, state=state)
         pins = load_pins()
         if any(sid not in where and sid not in buried_now and not remote.split_sid(sid) for sid in pins):
             pins = {sid for sid in pins if sid in where or sid in buried_now or remote.split_sid(sid)}
@@ -667,7 +697,7 @@ async def run(conn, args):
 
         if pending_requests():
             t = time.monotonic()
-            await handle_requests(app, ours, last_focus, hosts, remote_tabs)
+            await handle_requests(app, ours, last_focus, hosts, remote_tabs, hidden, focus, args.apply)
             parts["requests"] = time.monotonic() - t
             await app.async_refresh()
             await focus.refresh(app)
@@ -704,7 +734,7 @@ async def run(conn, args):
             tabs.append(Tab(session=sid, window=window, state=r["state"], state_ts=r["ts"],
                             buried=is_buried, focused=focus.has(sid), last_focus_ts=lf,
                             pinned=pinned.get(sid) == r["state"] or sid in pins, state_since=since[sid][1],
-                            selected=selected))
+                            selected=selected, hidden=sid in hidden))
 
         # Panel snapshot: every live agent tab, visible or buried (also split tabs).
         listed = [sid for sid, r in recs.items() if r.get("state") != states.ENDED
@@ -842,7 +872,7 @@ async def run(conn, args):
                       "since": since.get(sid, (None, recs[sid]["ts"]))[1],
                       "last": recs[sid]["ts"],
                       "buried": sid in buried_now, "focused": focus.has(sid),
-                      "pinned": sid in pins, "model": models.get(sid, (0, None))[1],
+                      "pinned": sid in pins, "hidden": sid in hidden, "model": models.get(sid, (0, None))[1],
                       "cpu": usage.get(sid, (None, None))[0], "mem_mb": usage.get(sid, (None, None))[1],
                       "hot": hot.get(sid, False),
                       "unseen": recs[sid]["state"] == states.DONE and not focus.has(sid)

@@ -3,8 +3,9 @@
 Read-only, nothing to install: each interval the daemon runs one shell script on the host
 (through the "connect" command) that only reads. It lists the tmux panes, runs ps, reads Claude
 Code's own status files (~/.claude/sessions/<pid>.json) and the end of each running Codex
-session file. Codex writes nothing when it waits for an approval, so the script also reads the
-last screen lines of each Codex pane (tmux capture-pane) and looks for its approval prompts.
+session file. Codex writes nothing when it waits for an approval, and agy keeps its state in
+files the script does not read, so the script also reads the last screen lines of each Codex
+and agy pane (tmux capture-pane) and looks for their prompts (agy: also its working footer).
 `python -m agent_hover.remote script` prints the exact script. Only a click on a
 remote row changes something: in a local iTerm2 tab already attached to that tmux session, it
 selects the row's tmux window and pane; else it opens a tab with the "attach" command. A tab
@@ -51,7 +52,7 @@ SEP = "|~|"  # tmux prints control characters as \ooo, so not \x1f
 CODEX_TAIL = 65536  # bytes of each Codex session file per scan: the last turn record and limits
 MODEL_EVERY_S = 60.0
 ATTACH_TMUX = "tmux attach -t {pane} \\; select-window -t {pane} \\; select-pane -t {pane}"
-SCREEN_LINES = 30  # last non-empty screen lines of a Codex pane per scan
+SCREEN_LINES = 30  # last non-empty screen lines of a Codex or agy pane per scan
 # Codex prompts that wait for the person (approval, question, trust), from herdr's Codex
 # detection rules (github.com/herdrdev/herdr, Apache-2.0). Codex sets its terminal title (the
 # tmux pane title) to "Action Required" while it waits; older Codex versions only show the
@@ -60,6 +61,16 @@ CODEX_TITLE_BLOCKED = "Action Required"
 CODEX_BLOCKERS = ("press enter to confirm or esc to cancel", "enter to submit answer", "enter to submit all",
                   "allow command?", "do you trust the contents of this directory?", "trust this folder?")
 CODEX_BLOCKER_LINES = 20
+# agy (Antigravity CLI) screens, from herdr's antigravity rules (same source): a dialog replaces
+# the prompt box and ends with a key-hint row above the "esc to cancel" footer; a working turn
+# shows "esc to cancel" under the prompt box, or a braille spinner above it.
+AGY_DIALOGS = ((("navigate", "tab amend"), 2, "approve"),  # permission: "↑/↓ Navigate · tab Amend · ..."
+               (("navigate", "esc skip"), 2, "answer"),  # question
+               (("do you trust the contents of this project?", "yes, i trust this folder", "enter confirm"), 8,
+                "trust"))
+AGY_WORKING_FOOTER = re.compile(r"(?m)^\s*─{3,}\s*esc to cancel\b")
+AGY_SPINNER = re.compile(r"(?m)^\s*[\u2801-\u28FF]+\s+\S")
+AGY_TITLE = "agi"  # agy's fixed terminal title: no name
 SHELLS = {"zsh", "bash", "fish", "sh", "dash", "-zsh", "-bash", "login"}
 
 # Each running Codex (not `codex exec`): its open session files whose first line says
@@ -300,6 +311,11 @@ def parse_output(text):
     return out
 
 
+def screen_text(lines):
+    """The panel's question text from screen lines: the last ones, long space runs cut."""
+    return "\n".join(re.sub(r" {3,}", "  ", line) for line in lines[-CODEX_BLOCKER_LINES:])[-1500:]
+
+
 def codex_blocker(title, screen):
     """The prompt text when a Codex pane waits for the person (its title or its last screen
     lines show an approval, question or trust prompt), else None."""
@@ -308,15 +324,34 @@ def codex_blocker(title, screen):
     low = text.lower()
     update = "update available" in low and low.endswith(("esc skip", "press enter to continue"))  # start-up picker
     if CODEX_TITLE_BLOCKED in (title or "") or update or any(b in low for b in CODEX_BLOCKERS):
-        return text[-1500:] or "Codex waits for you (see the pane)."
+        return screen_text(bottom) or "Codex waits for you (see the pane)."
     return None
+
+
+def agy_screen_state(screen):
+    """(state, detail, question) of an agy pane from its last screen lines, or None (no screen
+    read yet). A prompt waits, the working footer or a spinner works, else idle."""
+    if screen is None:
+        return None
+    lines = [line.rstrip() for line in screen if line.strip()]
+    for words, last, detail in AGY_DIALOGS:
+        if all(w in "\n".join(lines[-last:]).lower() for w in words):
+            return states.WAITING, detail, screen_text(lines)
+    whole = "\n".join(lines).lower()
+    if "requesting permission for:" in whole and ("do you want to proceed?" in whole
+                                                  or ("tab amend" in whole and "edit command" in whole)):
+        return states.WAITING, "approve", screen_text(lines)  # before agy 1.1.28
+    if AGY_WORKING_FOOTER.search("\n".join(lines[-2:]).lower()) or AGY_SPINNER.search("\n".join(lines[-12:])):
+        return states.WORKING, "", None
+    return states.IDLE, "", None
 
 
 def build_rows(parsed, now):
     """key -> row for each tmux pane with an agent. A Claude row comes from Claude's own status
     file (status, folder, session ID, pane); a Codex row from the end of its session file; any
     other agent process in a pane from the pane title (Claude's glyph) only. A Codex pane whose
-    title or screen shows a prompt waits (codex_blocker)."""
+    title or screen shows a prompt waits (codex_blocker); an agy pane's state comes from its
+    screen (agy_screen_state)."""
     table = parsed["ps"]
     children = {}
     for pid, row in table.items():
@@ -399,6 +434,10 @@ def build_rows(parsed, now):
             question = codex_blocker(panes[pane]["pane_title"], parsed["screens"].get(pane))
             if question:
                 f.update(state=states.WAITING, detail="approve", question=question, screen=True)
+        elif f["agent"] == "agy":
+            seen = agy_screen_state(parsed["screens"].get(pane))
+            if seen:
+                f.update(state=seen[0], detail=seen[1], question=seen[2], screen=True)
 
     rows = {}
     host = parsed["host"].split(".")[0]
@@ -408,8 +447,8 @@ def build_rows(parsed, now):
         if not key:
             continue
         title = agents.clean_name(p["pane_title"])
-        if title.split(".")[0] == host:
-            title = ""  # tmux's default title: the host name
+        if title.split(".")[0] == host or (f["agent"] == "agy" and title == AGY_TITLE):
+            title = ""  # tmux's default title (the host name), or agy's fixed one
         cpu, mem = agents.tree_usage(usage, f["pid"], children)
         waiting = f["state"] == states.WAITING
         rows[key] = {"key": key, "pane": pane, "tmux_session": p["session_name"], "window": p["window_index"],
@@ -418,7 +457,7 @@ def build_rows(parsed, now):
                      "question": f.get("question") if waiting else None,
                      "resets_at": f.get("resets_at") if waiting else None,
                      "since": f["since"], "agent_session": f.get("agent_session"), "path": f.get("path"),
-                     "screen_wait": bool(f.get("screen")),
+                     "screen_state": bool(f.get("screen")),
                      "cpu": cpu, "mem_mb": mem,
                      "active": p["pane_active"] == "1" and p["window_active"] == "1"
                                and p["session_attached"] not in ("", "0")}
@@ -490,7 +529,7 @@ class Host:
         want = [(r["agent"], r["agent_session"], r.get("path")) for r in rows if r.get("agent_session")]
         due = now - self.models_ts > MODEL_EVERY_S or any(r["agent_session"] not in self.models
                                                          for r in rows if r.get("agent_session"))
-        screens = [r["pane"] for r in rows if r["agent"] == "codex"]
+        screens = [r["pane"] for r in rows if r["agent"] in ("codex", "agy")]
         code, out = self.run(collect_script(want if due else (), screens))
         parsed = parse_output(out) if code == 0 else None
         if not parsed or not parsed["complete"]:
@@ -502,10 +541,12 @@ class Host:
             return False
         rows = build_rows(parsed, now)
         with self.lock:
-            for key, r in rows.items():  # a prompt seen on the screen waits since the first scan that saw it
+            for key, r in rows.items():  # a state seen on the screen lasts since the first scan that saw it
                 old = self.rows.get(key)
-                if r["screen_wait"]:
-                    r["since"] = old["since"] if old and old.get("screen_wait") else now
+                if r["screen_state"]:
+                    same = (old and old.get("screen_state") and old["state"] == r["state"]
+                            and old.get("question") == r.get("question"))  # a new prompt: a new time
+                    r["since"] = old["since"] if same else now
             if due:  # a session with no model line is asked again only at the next minute
                 for _, sid, _ in want:
                     self.models[sid] = parsed["models"].get(sid, self.models.get(sid))

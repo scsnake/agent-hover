@@ -24,6 +24,7 @@ class Tab:
     pinned: bool = False         # the person unburied it by hand; keep it until its state changes
     state_since: float = 0.0     # when the current state began (0 = unknown: use state_ts)
     selected: bool = False       # the selected tab of its window, also while iTerm2 is not active
+    hidden: bool = False         # the person hid it (panel); keep it buried until its state changes
 
 
 @dataclass
@@ -39,6 +40,8 @@ def seen(t):
 
 
 def must_show(t):
+    if t.hidden:
+        return False
     # A window's selected tab stays: the person comes back to it after using another app.
     return (t.focused or t.selected or t.pinned or t.state == WAITING
             or (t.state == DONE and not seen(t)))
