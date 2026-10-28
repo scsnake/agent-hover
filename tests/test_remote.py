@@ -196,3 +196,50 @@ def test_match_tab():
     assert remote.match_tab([("bot", *master, None)], {"/dev/ttys009": {master: 1.0}}, "bot") == "/dev/ttys009"
     assert remote.match_tab([("bot", *master, None)], local, "bot") is None
     assert remote.match_tab([("bot", *master, 9000.0)], local, "bot") is None  # no tab that old
+
+
+def codex_working_tail():
+    started = {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t2", "started_at": NOW - 40}}
+    return 'cut first line"}\n' + json.dumps(started)
+
+
+APPROVAL = ["• Running ls", "", "  Would you like to run the following command?", "  $ rm -rf build",
+            "› 1. Yes, proceed (y)", "  2. No, and tell Codex what to do differently (esc)",
+            "  Press enter to confirm or esc to cancel"]
+
+
+def test_codex_prompt_on_screen_waits():
+    out = scan_output(codex_working_tail())
+    rows = remote.build_rows(remote.parse_output(out), NOW)
+    assert rows["tmux-2538-5"]["state"] == states.WORKING  # no screen read yet
+    m = remote.MARK
+    screen = "\n".join([f"{m} screen %5", *APPROVAL])
+    rows = remote.build_rows(remote.parse_output(out.replace(f"{m} end", screen + f"\n{m} end")), NOW)
+    x = rows["tmux-2538-5"]
+    assert (x["state"], x["detail"], x["screen_wait"]) == (states.WAITING, "approve", True)
+    assert "rm -rf build" in x["question"] and "Press enter to confirm" in x["question"]
+    # The same words far above the bottom (older output) do not count.
+    old = "\n".join([f"{m} screen %5", *APPROVAL, *[f"line {i}" for i in range(25)]])
+    rows = remote.build_rows(remote.parse_output(out.replace(f"{m} end", old + f"\n{m} end")), NOW)
+    assert rows["tmux-2538-5"]["state"] == states.WORKING
+    # Codex's own title for a prompt is enough.
+    titled = out.replace(pane("2538", "%5", "a", "4", "210", "/data/other", "gpu-box", active="0"),
+                         pane("2538", "%5", "a", "4", "210", "/data/other", "Action Required", active="0"))
+    assert remote.build_rows(remote.parse_output(titled), NOW)["tmux-2538-5"]["state"] == states.WAITING
+    # A usage-limit stop stays as it is.
+    limit = remote.build_rows(remote.parse_output(scan_output(codex_limit_tail()).replace(
+        f"{m} end", screen + f"\n{m} end")), NOW)["tmux-2538-5"]
+    assert limit["detail"] == "usage limit" and not limit["screen_wait"]
+
+
+def test_screen_panes_in_script():
+    script = remote.collect_script((), ["%5", "%6; ls", "x"])
+    assert "capture-pane -p -J -t %5 " in script and "%6" not in script and " -t x" not in script
+
+
+def test_codex_update_picker_waits():
+    picker = ["  Update available · 0.164.0 → 0.165.0", "› 1. Update now", "  2. Skip", "  3. Skip until next version",
+              "  enter continue · esc skip"]
+    assert remote.codex_blocker("MacBookPro", picker)
+    notice = ["│ ✨ Update available! 0.164.0 -> 0.165.0 │", "› Ask Codex to do anything", "  ? for shortcuts"]
+    assert remote.codex_blocker("⠋ cxa", notice) is None

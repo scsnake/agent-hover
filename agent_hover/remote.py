@@ -3,7 +3,9 @@
 Read-only, nothing to install: each interval the daemon runs one shell script on the host
 (through the "connect" command) that only reads. It lists the tmux panes, runs ps, reads Claude
 Code's own status files (~/.claude/sessions/<pid>.json) and the end of each running Codex
-session file. `python -m agent_hover.remote script` prints the exact script. Only a click on a
+session file. Codex writes nothing when it waits for an approval, so the script also reads the
+last screen lines of each Codex pane (tmux capture-pane) and looks for its approval prompts.
+`python -m agent_hover.remote script` prints the exact script. Only a click on a
 remote row changes something: in a local iTerm2 tab already attached to that tmux session, it
 selects the row's tmux window and pane; else it opens a tab with the "attach" command. A tab
 the person attached by hand is found when its ssh connection is the one a tmux client of that
@@ -49,6 +51,15 @@ SEP = "|~|"  # tmux prints control characters as \ooo, so not \x1f
 CODEX_TAIL = 65536  # bytes of each Codex session file per scan: the last turn record and limits
 MODEL_EVERY_S = 60.0
 ATTACH_TMUX = "tmux attach -t {pane} \\; select-window -t {pane} \\; select-pane -t {pane}"
+SCREEN_LINES = 30  # last non-empty screen lines of a Codex pane per scan
+# Codex prompts that wait for the person (approval, question, trust), from herdr's Codex
+# detection rules (github.com/herdrdev/herdr, Apache-2.0). Codex sets its terminal title (the
+# tmux pane title) to "Action Required" while it waits; older Codex versions only show the
+# prompt. Only the bottom lines are read: older output can quote the same words.
+CODEX_TITLE_BLOCKED = "Action Required"
+CODEX_BLOCKERS = ("press enter to confirm or esc to cancel", "enter to submit answer", "enter to submit all",
+                  "allow command?", "do you trust the contents of this directory?", "trust this folder?")
+CODEX_BLOCKER_LINES = 20
 SHELLS = {"zsh", "bash", "fish", "sh", "dash", "-zsh", "-bash", "login"}
 
 # Each running Codex (not `codex exec`): its open session files whose first line says
@@ -201,9 +212,10 @@ def match_tab(clients, local, tmux_session):
     return None
 
 
-def collect_script(models=()):
+def collect_script(models=(), screens=()):
     """The read-only script for one scan. models: ("claude" | "codex", session ID, file or None)
-    whose model line to read this time (once a minute)."""
+    whose model line to read this time (once a minute). screens: tmux panes whose last screen
+    lines to read (the Codex panes of the last scan)."""
     fmt = SEP.join("#{%s}" % f for f in FIELDS)
     lines = [f"S={MARK}",
              'echo "$S host $(hostname)"',
@@ -220,13 +232,18 @@ def collect_script(models=()):
                          f'{{ echo "$S model {sid}"; tail -c 1048576 "$f" | grep -o \'"model": *"[^"]*"\' | tail -n 1; }}; done')
         elif agent == "codex" and path:
             lines.append(f'echo "$S model {sid}"; grep -o \'"model": *"[^"]*"\' {shlex.quote(path)} 2>/dev/null | tail -n 1')
+    for pane in screens:
+        if PANE_RE.fullmatch(str(pane)):
+            lines.append(f'echo "$S screen {pane}"; tmux capture-pane -p -J -t {pane} 2>/dev/null'
+                         f" | awk 'NF' | tail -n {SCREEN_LINES}")
     lines.append('echo "$S end"')
     return "\n".join(lines) + "\n"
 
 
 def parse_output(text):
-    """The script's output -> {"host", "panes", "ps", "claude", "codex", "models", "complete"}."""
-    out = {"host": "", "panes": [], "ps": {}, "claude": [], "codex": [], "models": {}, "complete": False}
+    """The script's output -> {"host", "panes", "ps", "claude", "codex", "models", "screens", "complete"}."""
+    out = {"host": "", "panes": [], "ps": {}, "claude": [], "codex": [], "models": {}, "screens": {},
+           "complete": False}
     section, body = None, []
 
     def close():
@@ -262,6 +279,9 @@ def parse_output(text):
             m = re.search(r'"model": *"([^"]{1,80})"', "\n".join(body))
             if m and states.UUID_RE.fullmatch(args.strip()):
                 out["models"][args.strip()] = m.group(1)
+        elif kind == "screen":
+            if PANE_RE.fullmatch(args.strip()):
+                out["screens"][args.strip()] = body[-SCREEN_LINES:]
 
     for line in text.splitlines():
         if line.startswith(MARK + " "):
@@ -280,10 +300,23 @@ def parse_output(text):
     return out
 
 
+def codex_blocker(title, screen):
+    """The prompt text when a Codex pane waits for the person (its title or its last screen
+    lines show an approval, question or trust prompt), else None."""
+    bottom = [line.rstrip() for line in (screen or []) if line.strip()][-CODEX_BLOCKER_LINES:]
+    text = "\n".join(bottom)
+    low = text.lower()
+    update = "update available" in low and low.endswith(("esc skip", "press enter to continue"))  # start-up picker
+    if CODEX_TITLE_BLOCKED in (title or "") or update or any(b in low for b in CODEX_BLOCKERS):
+        return text[-1500:] or "Codex waits for you (see the pane)."
+    return None
+
+
 def build_rows(parsed, now):
     """key -> row for each tmux pane with an agent. A Claude row comes from Claude's own status
     file (status, folder, session ID, pane); a Codex row from the end of its session file; any
-    other agent process in a pane from the pane title (Claude's glyph) only."""
+    other agent process in a pane from the pane title (Claude's glyph) only. A Codex pane whose
+    title or screen shows a prompt waits (codex_blocker)."""
     table = parsed["ps"]
     children = {}
     for pid, row in table.items():
@@ -361,6 +394,12 @@ def build_rows(parsed, now):
                 break
             todo.extend(sorted(children.get(pid, [])))
 
+    for pane, f in found.items():
+        if f["agent"] == "codex" and f["state"] in (states.WORKING, states.IDLE):
+            question = codex_blocker(panes[pane]["pane_title"], parsed["screens"].get(pane))
+            if question:
+                f.update(state=states.WAITING, detail="approve", question=question, screen=True)
+
     rows = {}
     host = parsed["host"].split(".")[0]
     for pane, f in found.items():
@@ -379,6 +418,7 @@ def build_rows(parsed, now):
                      "question": f.get("question") if waiting else None,
                      "resets_at": f.get("resets_at") if waiting else None,
                      "since": f["since"], "agent_session": f.get("agent_session"), "path": f.get("path"),
+                     "screen_wait": bool(f.get("screen")),
                      "cpu": cpu, "mem_mb": mem,
                      "active": p["pane_active"] == "1" and p["window_active"] == "1"
                                and p["session_attached"] not in ("", "0")}
@@ -450,7 +490,8 @@ class Host:
         want = [(r["agent"], r["agent_session"], r.get("path")) for r in rows if r.get("agent_session")]
         due = now - self.models_ts > MODEL_EVERY_S or any(r["agent_session"] not in self.models
                                                          for r in rows if r.get("agent_session"))
-        code, out = self.run(collect_script(want if due else ()))
+        screens = [r["pane"] for r in rows if r["agent"] == "codex"]
+        code, out = self.run(collect_script(want if due else (), screens))
         parsed = parse_output(out) if code == 0 else None
         if not parsed or not parsed["complete"]:
             with self.lock:
@@ -461,6 +502,10 @@ class Host:
             return False
         rows = build_rows(parsed, now)
         with self.lock:
+            for key, r in rows.items():  # a prompt seen on the screen waits since the first scan that saw it
+                old = self.rows.get(key)
+                if r["screen_wait"]:
+                    r["since"] = old["since"] if old and old.get("screen_wait") else now
             if due:  # a session with no model line is asked again only at the next minute
                 for _, sid, _ in want:
                     self.models[sid] = parsed["models"].get(sid, self.models.get(sid))

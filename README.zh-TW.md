@@ -175,6 +175,7 @@
 - `ps`：哪些窗格在執行 `claude` 或 `codex`，以及 CPU 與記憶體。每行指令只送出前兩個字。
 - `~/.claude/sessions/*.json`：Claude Code 為每個執行中 session 寫的狀態檔（busy、idle 或 waiting；資料夾；tmux 窗格）。
 - 每個執行中 Codex session 檔（`~/.codex/sessions`）的最後 64 KB，以及每分鐘一次各代理對話紀錄中的模型名稱。
+- `tmux capture-pane -p`：每個 Codex 窗格最後 30 行非空白的畫面。Codex 等待核准時不寫任何檔案。窗格標題為「Action Required」，或底部幾行出現核准、提問、信任或更新提示時，該列顯示 **waiting**，並以該提示為問題。提示文字取自 [herdr](https://github.com/herdrdev/herdr) 的 Codex 偵測規則（Apache-2.0）。
 
 懸停預覽執行 `tmux capture-pane -p`。只有點擊會改變東西。若已有本機分頁連到該 tmux session，就在那裡選取該列的 tmux 視窗與窗格（`tmux select-window`、`select-pane`）；否則開一個執行 `attach` 的本機分頁。你自己連上的分頁，依 ssh 連線找出：背景程式執行 `tmux list-clients`，讀取每個 client 的 `SSH_CONNECTION`（Linux 主機），再與本機 ssh 的連接埠（`lsof`）比對。經由 ControlMaster 的 ssh 分頁，使用 master 的連線。多個分頁共用同一條連線時，選 ssh 啟動時間與遠端 ssh session 相同的那個分頁。背景程式的紀錄（`./run.sh log`）會記下啟動時的腳本，以及每次 peek 與 select 指令。
 
