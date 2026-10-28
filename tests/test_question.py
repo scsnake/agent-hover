@@ -65,3 +65,8 @@ def test_late_post_tool_use_keeps_done(monkeypatch, tmp_path):
     assert send("Stop") == "done"
     assert send("PostToolUse") == "done"   # late background tool end: still done
     assert send("PreToolUse") == "working"  # new work
+    send("Stop")
+    states.write_state(uuid, {**states.read_state(uuid), "state": "idle", "event": "seed"})  # a daemon restart
+    assert send("PostToolUse") == "idle"
+    assert send("PermissionRequest") == "waiting"
+    assert send("PostToolUse") == "working"  # approved: the turn goes on

@@ -5,6 +5,7 @@ here never blocks the agent. For agy it always prints the JSON answer agy needs 
 PreToolUse: agy's own permission rules still decide).
 """
 import json
+import os
 import subprocess
 import sys
 import time
@@ -46,6 +47,14 @@ def main():
         payload = json.load(sys.stdin)
     except ValueError:
         return
+    if (agent in ("claude", "codex") and payload.get("hook_event_name") in ("SessionStart", "UserPromptSubmit")
+            and payload.get("session_id")):
+        try:  # its command line, so that a resume from the panel repeats the options
+            from agent_hover import commands
+            if payload["hook_event_name"] == "SessionStart" or payload["session_id"] not in commands.load():
+                commands.remember_from_hook(agent, payload["session_id"], os.getppid())
+        except Exception:  # noqa: BLE001 - never break the agent
+            pass
     if agent == "agy":
         payload = states.agy_payload(sys.argv[2] if len(sys.argv) > 2 else "", payload)
     # A background job has no tab environment: find its tab through the session ID.
@@ -67,9 +76,9 @@ def main():
         return
     state, detail = mapped
     prev = states.read_state(uuid) or {}
-    if (payload.get("hook_event_name") == "PostToolUse" and prev.get("state") == states.DONE
+    if (payload.get("hook_event_name") == "PostToolUse" and prev.get("state") in (states.DONE, states.IDLE)
             and prev.get("agent") == agent):
-        return  # a background command can end after Stop: the turn is still done
+        return  # a background command can end after Stop (or after a restart seeded "idle"): no turn
     if agent == "agy" and payload.get("session_id"):
         # A sub-agent has its own conversation and fires the same hooks: report the main one.
         from agent_hover import agents

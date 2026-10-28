@@ -128,7 +128,7 @@
 - `panel.hotkey`：在任何 App 中按下，以搜尋模式打開清單，在其他桌面空間也可以。再按一次關閉。修飾鍵：`ctrl`、`opt`、`cmd`、`shift`；按鍵：字母、數字、`space`、`return`、`tab`、`f1`–`f12` 與部分標點。`"off"` 表示關閉。如果沒有反應，很可能有其他 App 用了同一組按鍵（例如 Alfred 或 Raycast 的 `opt+space`）。
 - `panel.fold_idle_h`：已完成或閒置超過這麼多小時的分頁，會收合成清單最後的一行。游標停在這一行上，或點它，就會展開。收合的分頁不計入膠囊上的數字。釘選的分頁、新的（還沒看過的）分頁與搜尋結果不會收合。`0` 表示關閉。
 - `panel.fold_waiting_h`：問題超過這麼多小時沒有回覆（被遺忘的對話），也會收合，且不再決定邊緣細條的顏色，也不計入膠囊上的數字。預設 24。`0` 表示等待中的分頁永遠不收合。
-- `panel.closed_days`：搜尋時也列出最近 N 天關閉的代理（只算真正的對話，不含 `claude -p` 或 `codex exec`）。點一下：新分頁會執行 `cd <資料夾>`，並輸入 `claude --resume <id>`（或 `codex resume <id>`），但不按 Enter。`0` 表示關閉。
+- `panel.closed_days`：搜尋時也列出最近 N 天關閉的代理（只算真正的對話，不含 `claude -p` 或 `codex exec`）。點一下：新分頁會執行 `cd <資料夾>`，並輸入 `claude --resume <id>`（或 `codex resume <id>`），但不按 Enter。指令會沿用該對話啟動時的選項（例如 `--model`、`--effort`、`--permission-mode`、`--dangerously-skip-permissions`，Codex 的 `-m`、`-s`、`-c`），並去掉提示詞、`--continue`/`--resume`、對話 ID、`--name` 與 `--worktree`。背景程式把每個啟動指令存在 `~/.agent-hover/commands.json`（保留 60 天）。背景程式沒看過就結束的對話，使用不帶選項的指令。`0` 表示關閉。
 - `panel.dock_px`、`panel.dock_delay_ms`：螢幕邊緣有多「黏」。拖曳中的面板要推過右邊緣至少 `dock_px`，並停留 `dock_delay_ms`（此時出現藍框），放開才會變成邊緣細條。稍微拉回就會變回面板。
 - `panel.magnet_px`：拖曳中的面板離螢幕邊緣在這個距離以內時，會貼齊邊緣（從邊緣細條拉出來後也一樣）。拖曳時按住 ⌥（Option）就不吸附。`0` 表示關閉。
 - `daemon.working_park_s`：你離開工作中的分頁這麼多秒後就隱藏它。預設 `0`：只有在可見的代理分頁超過 `n_active` 時，工作中的分頁才會隱藏（且最後才輪到它）。

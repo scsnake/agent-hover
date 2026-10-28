@@ -57,6 +57,16 @@ def claude_session(pid):
     return data if isinstance(data, dict) and data.get("pid") == pid else None
 
 
+def running_claude():
+    """{session ID: ("claude", pid)} of the running Claude processes (their own files)."""
+    out = {}
+    for path in CLAUDE_SESSIONS.glob("*.json"):
+        info = claude_session(path.stem) if path.stem.isdigit() else None
+        if info and isinstance(info.get("sessionId"), str):
+            out[info["sessionId"]] = ("claude", info["pid"])
+    return out
+
+
 CODEX_PIDS = {}  # Codex process ID -> its main session file, found once with lsof
 
 
@@ -280,6 +290,12 @@ def agy_running_family(root, tree=None):
                 and agy_root(cid, tree)[0] == root:
             out.append(cid)
     return out
+
+
+def agy_idle(root, tree=None):
+    """True when agy lists the main conversation as idle and none of its sub-agents runs."""
+    tree = agy_tree() if tree is None else tree
+    return tree.get(root, ("", ""))[1] == "CASCADE_RUN_STATUS_IDLE" and agy_running_family(root, tree) == [root]
 
 
 AGY_BRAIN = Path.home() / ".gemini" / "antigravity-cli" / "brain"

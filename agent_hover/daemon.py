@@ -21,7 +21,7 @@ from pathlib import Path
 
 import iterm2
 
-from agent_hover import agents, remote, search, states
+from agent_hover import agents, commands, remote, search, states
 from agent_hover.agents import (CLAUDE_SESSIONS, CLAUDE_STATUS, CODEX_PIDS, as_pid, child_map,  # noqa: F401
                                claude_session, clean_name, codex_main_rollout, codex_turn_update,
                                agy_conversation, detect_agent, process_table, seed_record, title_state,
@@ -31,8 +31,10 @@ from agent_hover.rules import Config, Tab, decide
 TICK_S = 1.0
 NAME_REFRESH_S = 5.0
 MODEL_REFRESH_S = 30.0  # read each tab's model from its transcript this often
+COMMANDS_SCAN_S = 30.0  # save the command line of running Claude sessions (for resume), this often
 USAGE_SCAN_S = 5.0  # CPU and memory of each agent's process tree, this often
 CODEX_SCAN_S = 5.0  # read the end of each working Codex tab's session file this often
+AGY_IDLE_S = 120.0  # a working agy tab with no hook event this long: ask agy's own list if it is idle
 AGY_SCAN_S = 2.0  # look for a permission prompt in each working agy tab's conversation this often
 UPDATE_FILE = states.HOME / "update.json"
 UPDATE_EVERY_S = 86400.0  # the opt-in update check ("update_check": true in config.json), once a day
@@ -614,6 +616,7 @@ async def run(conn, args):
     since = {}  # session -> (state, time the daemon first saw that state)
     names, names_ts = {}, 0.0
     models = {}  # session -> (time read, model or None)
+    commands_ts, job_pids = 0.0, {}  # iTerm2 session -> its foreground job (from the usage scan)
     usage, hot, hot_since, usage_ts = {}, {}, {}, 0.0  # session -> (cpu, MB) / bool / time hot began
     codex_paths, codex_ts = {}, 0.0  # Codex session ID -> its session file
     agy_ts = 0.0
@@ -773,6 +776,13 @@ async def run(conn, args):
                 by_us = rec.get("event") == "agy_waiting"
                 if not (rec.get("state") == states.WORKING or by_us):
                     continue
+                if (not by_us and now - rec.get("ts", now) > AGY_IDLE_S and agents.agy_idle(root, tree)
+                        and (states.read_state(sid) or {}).get("ts") == rec.get("ts")):
+                    # No Stop seen (or a late PostToolUse after it), and agy says the turn is over.
+                    rec = recs[sid] = {**rec, "state": states.DONE, "detail": "", "event": "agy_idle", "ts": now}
+                    states.write_state(sid, rec)
+                    log("agy_idle", session=sid)
+                    continue
                 step, asker = None, root
                 for cid in agents.agy_running_family(root, tree):  # a sub-agent can ask too
                     step = await asyncio.to_thread(agents.agy_waiting_step, cid)
@@ -800,13 +810,20 @@ async def run(conn, args):
             children = child_map(table)
             for sid in listed:
                 session = app.get_session_by_id(sid)
-                pid = as_pid(await session.async_get_variable("jobPid")) if session is not None else None
+                pid = job_pids[sid] = as_pid(await session.async_get_variable("jobPid")) if session is not None else None
                 if pid:
                     usage[sid] = tree_usage(table, pid, children)
                     hot[sid] = hot_update(hot_since, sid, recs[sid]["state"], usage[sid][0], now,
                                           args.cpu_hot_pct, args.cpu_hot_min)
             usage_ts = now
             parts["usage"] = time.monotonic() - t
+        if now - commands_ts > COMMANDS_SCAN_S:
+            commands_ts = now
+            # After the usage scan (it reads each tab's job). Codex runs its hooks in its
+            # app-server, not under the tab's codex: link tab job and session here.
+            found = {recs[sid]["agent_session"]: ("codex", job_pids[sid]) for sid in listed
+                     if recs[sid].get("agent") == "codex" and recs[sid].get("agent_session") and job_pids.get(sid)}
+            await asyncio.to_thread(commands.remember, {**found, **agents.running_claude()})
         for sid in listed:
             if now - models.get(sid, (0, None))[0] > MODEL_REFRESH_S:
                 path = search.transcript(recs[sid].get("agent", ""), recs[sid].get("agent_session"))

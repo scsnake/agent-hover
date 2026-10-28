@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-from agent_hover import states
+from agent_hover import commands, states
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
@@ -310,7 +310,8 @@ def recent_transcripts(days):
 
 
 def resume_command(agent, session_id, cwd):
-    run = f"claude --resume {session_id}" if agent == "claude" else f"codex resume {session_id}"
+    """The resume command, with the options the session started with (see commands.py)."""
+    run = shlex.join(commands.resume_words(agent, session_id))
     return f"cd {shlex.quote(cwd)} && {run}" if cwd else run
 
 

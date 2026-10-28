@@ -193,3 +193,12 @@ def test_hook_reports_the_main_conversation(tmp_path):
     assert json.loads(state.read_text())["agent_session"] == CONV
     run_hook("Stop", json.dumps(raw(terminationReason="model_stop")), env)
     assert json.loads(state.read_text())["state"] == "done"
+
+
+def test_agy_idle():
+    from agent_hover import agents
+    idle, run = "CASCADE_RUN_STATUS_IDLE", "CASCADE_RUN_STATUS_RUNNING"
+    tree = {"m": ("", idle), "s1": ("m", idle), "s2": ("s1", idle), "x": ("", run)}
+    assert agents.agy_idle("m", tree)
+    assert not agents.agy_idle("m", {**tree, "s2": ("s1", run)})  # a sub-agent still runs
+    assert not agents.agy_idle("x", tree) and not agents.agy_idle("unknown", tree)
