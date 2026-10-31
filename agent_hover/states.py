@@ -412,21 +412,32 @@ def write_state(uuid, record):
     os.replace(tmp, path)
 
 
-def read_states(max_age_s=2 * 86400):
-    """All state files, keyed by iTerm2 session UUID. Drops files older than max_age_s."""
+def read_states():
+    """All state files, keyed by iTerm2 session UUID."""
     out = {}
     if not STATE_DIR.is_dir():
         return out
-    now = time.time()
     for path in STATE_DIR.glob("*.json"):
         try:
-            if now - path.stat().st_mtime > max_age_s:
-                path.unlink(missing_ok=True)
-                continue
             out[path.stem] = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
     return out
+
+
+def prune_states(live, max_age_s=2 * 86400, now=None):
+    """Delete the state files of closed tabs (not in live) unchanged for max_age_s. A live tab
+    keeps its file however old: an agent can be idle for days. Returns the deleted sessions."""
+    now = time.time() if now is None else now
+    gone = []
+    for path in STATE_DIR.glob("*.json") if STATE_DIR.is_dir() else []:
+        try:
+            if path.stem not in live and now - path.stat().st_mtime > max_age_s:
+                path.unlink(missing_ok=True)
+                gone.append(path.stem)
+        except OSError:
+            continue
+    return gone
 
 
 LOG_MAX_BYTES = 5 * 1024 * 1024  # then the log moves to <name>.1 (one old file is kept)

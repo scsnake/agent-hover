@@ -116,11 +116,15 @@ async def seed_agents(app, known, checked):
                             if new.get("agent_session") != rec.get("agent_session"):
                                 log("seed_session", session=sid, agent_session=new.get("agent_session"))
                     continue
-                if checked.get(sid) == pid:
+                # A tab with no record: read again only when its job changes. ("no agent", pid), not
+                # the pid alone: a seeded tab whose state file went away must be seeded again.
+                if checked.get(sid) == ("no agent", pid):
                     continue
                 checked[sid] = pid
                 agent = detect_agent(await s.async_get_variable("processTitle"),
                                      await s.async_get_variable("commandLine"))
+                if not agent:
+                    checked[sid] = ("no agent", pid)
                 latest = states.read_state(sid) if reseed else None  # a hook may have just written it
                 if agent and (not states.state_path(sid).exists()
                               or (reseed and (latest or {}).get("ts") == (known.get(sid) or {}).get("ts"))):
@@ -664,6 +668,11 @@ async def run(conn, args):
         if now - seed_ts > SEED_SCAN_S:
             t = time.monotonic()
             await seed_agents(app, states.read_states(), seed_checked)
+            live = {s.session_id for w in app.terminal_windows for t in w.tabs for s in t.all_sessions}
+            live |= {s.session_id for s in app.buried_sessions}
+            if live:  # an empty list may be an iTerm2 hiccup: delete nothing then
+                for sid in states.prune_states(live):
+                    log("state_pruned", session=sid)
             parts["seed"] = time.monotonic() - t
             seed_ts = now
         recs = states.read_states()
