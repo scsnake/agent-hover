@@ -68,3 +68,21 @@ def test_prune_keeps_live_tabs(tmp_path, monkeypatch):
         os.utime(tmp_path / f"{sid}.json", (1000, 1000))
     gone = daemon.states.prune_states({"live"}, now=1000 + 3 * 86400)
     assert gone == ["closed"] and sorted(p.stem for p in tmp_path.glob("*.json")) == ["fresh", "live"]
+
+
+def test_hook_record_ends_when_agent_is_gone(tmp_path, monkeypatch):
+    import asyncio
+    import time
+
+    monkeypatch.setattr(daemon.states, "STATE_DIR", tmp_path)
+    shell = Sess("S", 70, title="zsh", cmd="-zsh")
+    app = type("A", (), {"terminal_windows": [Win([shell])]})()
+    rec = {"iterm": "S", "agent": "claude", "state": "idle", "event": "Notification", "ts": time.time() - 5}
+    daemon.states.write_state("S", rec)
+    checked = {}
+    asyncio.run(daemon.seed_agents(app, daemon.states.read_states(), checked))
+    assert daemon.states.read_state("S")["state"] == "idle"  # too fresh: maybe the agent only paused
+    daemon.states.write_state("S", {**rec, "ts": time.time() - daemon.AGENT_GONE_S - 5})
+    asyncio.run(daemon.seed_agents(app, daemon.states.read_states(), checked))
+    new = daemon.states.read_state("S")
+    assert (new["state"], new["event"]) == ("ended", "agent_gone")

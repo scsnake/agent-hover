@@ -48,6 +48,7 @@ PINS_FILE = states.HOME / "pins.json"  # tabs pinned in the panel: never parked
 GROUP_ORDER = {states.WAITING: 0, states.DONE: 1, states.WORKING: 2, states.IDLE: 3}
 SEED_SCAN_S = 5.0
 ENDED_GRACE_S = 10.0  # an agent that wrote SessionEnd may still be the tab's job for a moment
+AGENT_GONE_S = 60.0  # a hook record with no agent in its tab this long: the agent quit without SessionEnd
 
 
 def notify(title, text):
@@ -87,6 +88,17 @@ async def seed_agents(app, known, checked):
                     agent = detect_agent(await s.async_get_variable("processTitle"),
                                          await s.async_get_variable("commandLine"))
                     ended_long = rec.get("state") == states.ENDED and now - rec.get("ts", now) > ENDED_GRACE_S
+                    if not agent and rec.get("state") != states.ENDED:
+                        # No agent in the tab, but the record says one runs: it quit with no
+                        # SessionEnd (crash, kill). After AGENT_GONE_S, mark the record ended.
+                        if now - rec.get("ts", now) > AGENT_GONE_S:
+                            if (states.read_state(sid) or {}).get("ts") == rec.get("ts"):
+                                states.write_state(sid, {**rec, "state": states.ENDED, "ts": now,
+                                                         "event": "agent_gone", "detail": ""})
+                                log("agent_gone", session=sid, agent=rec.get("agent"), was_state=rec.get("state"))
+                        else:
+                            checked.pop(sid, None)  # look again at the next scan
+                        continue
                     if not agent or (agent == rec.get("agent") and not ended_long):
                         if rec.get("state") == states.ENDED and not ended_long:
                             checked.pop(sid, None)  # look again after the grace time
