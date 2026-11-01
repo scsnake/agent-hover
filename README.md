@@ -23,6 +23,7 @@ Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs
 | Peek | Hover any other row to see the last lines of that tab's screen, without switching to it |
 | CPU and memory | Hover the agent mark at the right end of a row: the frame shows the agent, model, CPU and memory (instead of the screen) of the agent and the commands it runs. A red flame marks an agent that is not working but uses much CPU (stuck, or a command still running) |
 | Quota | The same frame shows, one line each in the style of the [coralline](https://github.com/Nanako0129/coralline) status line: the model, the effort, the context window use (gauge, %, tokens in and out), and the usage limits 5h and 7d (gauge, %, time to reset and reset time), with "as of ..." when the data is older than 10 min. No request is sent: Codex writes its limits to its session file after each turn; Claude Code and agy send them to their status-line command, so the install puts a small wrapper (`quota_tee.py`) in front of that command. It saves the limits and runs the same command. With no status line set, Claude and agy show no quota (Claude: unless the coralline status line keeps its limit store) |
+| Subagents | While a Claude Code or Codex session has subagents running, its tab counts as **working**, also after the main agent ended its turn, so the tab does not hide. The row shows "2 subagents", and the frame on the agent mark shows how many run and how many are done, with the type, task and run time of up to 3 running subagents. The frame stays open when you move the cursor to it within 0.4 s. Hover a subagent line to open a second frame with that subagent's model, last tool and last message. Hover the ⑂ line, or stay on the agent mark for 1.5 s, to see all running subagents and the last 3 that ended. This reads only the files the agents write. Local tabs only |
 | "New" dot | A blue dot marks a done tab that you have not looked at yet |
 | Pin | Hover a row and click the pin icon at its end (or right-click → **Pin**). A pinned tab is never hidden and is listed first |
 | Hide now | Hover a row and click the eye-slash icon (or right-click → **Hide now**). The tab is hidden at once, also the tab you use. It comes back when its state changes (it waits for you, or ends its turn), or when you click its row. Hiding a pinned tab unpins it. Not in dry run |
@@ -245,6 +246,7 @@ Everything stays on your Mac. There are no network calls, except:
 - For a working Codex tab, the daemon reads the end of its session file (`~/.codex/sessions`) every 5 s. Codex sends no hook when a turn ends with an error, so this is how a usage-limit stop shows as **waiting** (Codex then asks whether to switch to a smaller model). A Codex tab with no hook event yet is matched to its session file through the files its process has open (`lsof`).
 - Newer Codex versions run their hooks in the `codex app-server` daemon, not under the `codex` in the tab. The daemon keeps the environment of the tab that started it, so `$ITERM_SESSION_ID` names the wrong tab. The hook sees that its parent is `codex app-server`. It then finds the tab through the session ID (the open Codex tab whose record names it), or else through the folder: the open Codex tab with the same folder, a tab with no session yet first. Two new Codex tabs in the same folder: the event is skipped (no guess) and logged as `unrouted` in `events.jsonl`.
 - Peek reads the hovered tab's screen through iTerm2, and keeps the last lines in `~/.agent-hover/peek.json`.
+- For the subagent frame, the daemon reads the end of each subagent's log and keeps its last tool call and last message in `~/.agent-hover/panel.json`, while the tab is open.
 
 ## How it works
 
@@ -273,6 +275,8 @@ Tests: `uv run pytest`. The end-to-end test `tests/e2e_sandbox.py` opens a test 
 ## Limits
 
 - macOS and iTerm2 only. Only iTerm2 can hide a tab and keep it running.
+- A subagent that crashed never says that it ended: its tab can show working for up to 15 minutes after its last write. A subagent that writes nothing for 15 minutes does not count as running.
+- Subagents are not shown for agy and remote rows. The Codex done count reads only the session folders of today and yesterday.
 - Claude Code, Codex and agy only, out of the box.
 - agy has no hook event for a permission prompt. Every 2 s the daemon reads each working agy tab's conversation database (`~/.gemini/antigravity-cli/conversations/<id>.db`, read-only): a step marked waiting shows the row as **waiting**, with the command as the question. This uses agy's internal format, which may change. `agy -p` runs (for example a review that another agent starts in its tab) are ignored.
 - Remote agents show only when they run in tmux, and only from the hosts in `remote.hosts`. Their state is polled, so it is less exact than with hooks (see [Remote hosts](#remote-hosts-tmux-over-ssh)).

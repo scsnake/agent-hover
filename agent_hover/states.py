@@ -172,11 +172,12 @@ def codex_rollout(session_id):
 CODEX_TURN_TYPES = ("task_started", "task_complete", "turn_aborted")
 
 
-def codex_last_turn(path, tail_bytes=262144, text=None):
+def codex_last_turn(path, tail_bytes=262144, text=None, main_only=True):
     """The last turn record of the main agent in a Codex session file (task_started,
     task_complete or turn_aborted payload), or None. Codex sends no Stop hook when a turn ends
     with an error (for example usage_limit_exceeded), so the file is the only sign.
-    text: the end of the file, already read (a remote host); path is then not used."""
+    text: the end of the file, already read (a remote host); path is then not used.
+    main_only=False: any thread's last turn (the file of a subagent thread)."""
     tail = text if text is not None else _file_part(path, tail_bytes, tail=True)
     for line in reversed(tail.splitlines()):
         if '"event_msg"' not in line or not any(f'"{t}"' in line for t in CODEX_TURN_TYPES):
@@ -187,7 +188,7 @@ def codex_last_turn(path, tail_bytes=262144, text=None):
             continue  # the cut first line of the tail
         if payload.get("type") not in CODEX_TURN_TYPES:
             continue
-        if payload.get("root_turn_id", payload.get("turn_id")) != payload.get("turn_id"):
+        if main_only and payload.get("root_turn_id", payload.get("turn_id")) != payload.get("turn_id"):
             continue  # a sub-agent's turn
         return payload
     return None

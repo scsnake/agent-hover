@@ -116,6 +116,23 @@ struct Row: Decodable {
     let place: String?     // that pane's tmux session and window, e.g. "a:3"
     let quota: Quota?      // the agent's usage limits (daemon quota.py), as of quota.ts
     let status: AgentStatus?  // model, effort and context use of the agent session (quota.py)
+    let subagents: Subagents? // the session's subagents (subagents.py)
+}
+
+struct Subagents: Decodable {
+    let running: [SubagentRun]
+    let recent: [SubagentRun]?  // the last ones that ended, newest first
+    let done: Int
+}
+
+struct SubagentRun: Decodable {
+    let kind: String
+    let what: String
+    let since: Double
+    let ended: Double?     // last write to its log
+    let model: String?
+    let tool: String?      // its last tool call
+    let message: String?   // its last message
 }
 
 struct AgentStatus: Decodable {
@@ -447,8 +464,12 @@ func xterm(_ hex: UInt32) -> NSColor {
 }
 
 let pillModel = xterm(0xD7875F), pillEffort = xterm(0xAF87FF), pillCtx = xterm(0x444444)
-let pill5h = xterm(0x3A3A3A), pill7d = xterm(0x303030)
+let pill5h = xterm(0x3A3A3A), pill7d = xterm(0x303030), pillSub = xterm(0x005F87)
 let inkText = xterm(0xFFFFFF), inkDim = xterm(0x8A8A8A)
+let subTag = NSAttributedString.Key("subagentTag")  // on an info frame line: subagent index, -1 = all
+let keepOpenS = 0.4  // the info frame waits this long for the cursor that left the agent mark
+let subAutoS = 1.5   // this long on the agent mark opens the subagent frame
+let infoWidth: CGFloat = 340, subWidth: CGFloat = 420  // text width of the frames: the same for each row
 
 func gaugeInk(_ pct: Double) -> NSColor { pct >= 75 ? xterm(0xD75F5F) : pct >= 50 ? xterm(0xD7AF5F) : xterm(0x87D787) }
 
@@ -486,6 +507,39 @@ func pillLine(_ parts: [(String, NSColor)], _ bg: NSColor, bold: Bool = false) -
     return s
 }
 
+func shortAge(_ since: Double) -> String {
+    age(since).trimmingCharacters(in: CharacterSet(charactersIn: "\u{2007}"))
+}
+
+func subagentTitle(_ r: SubagentRun) -> String {
+    r.what.isEmpty ? r.kind : "\(r.kind): \(r.what)"
+}
+
+/// The subagent frame: one subagent (pick = its index in running), or all (pick = -1: the running
+/// ones and the last that ended). Empty when there is nothing to show.
+func styledSubagents(_ sub: Subagents, _ pick: Int) -> NSAttributedString {
+    let one = sub.running.indices.contains(pick)
+    let all = one ? [sub.running[pick]] : Array(sub.running.prefix(6))
+    let more = sub.running.count - all.count
+    let s = NSMutableAttributedString()
+    func line(_ t: String, _ color: NSColor, bold: Bool = false) {
+        s.append(NSAttributedString(string: t + "\n", attributes: [
+            .font: NSFont.systemFont(ofSize: fs(12), weight: bold ? .semibold : .regular), .foregroundColor: color]))
+    }
+    func block(_ r: SubagentRun, _ when: String) {
+        if s.length > 0 { line("", .labelColor) }
+        line(subagentTitle(r), .labelColor, bold: true)
+        line(([when] + (r.model.map { [$0] } ?? [])).joined(separator: " · "), .secondaryLabelColor)
+        if let t = r.tool, !t.isEmpty { line("Tool: " + t, .labelColor) }
+        if let m = r.message, !m.isEmpty { line(m, .labelColor) }
+    }
+    for r in all { block(r, "running \(shortAge(r.since))") }
+    if !one && more > 0 && !s.string.isEmpty { line("and \(more) more running", .secondaryLabelColor) }
+    if !one { for r in sub.recent ?? [] { block(r, "ended \(shortAge(r.ended ?? r.since)) ago") } }
+    if s.length > 0 { s.deleteCharacters(in: NSRange(location: s.length - 1, length: 1)) }  // the last newline
+    return s
+}
+
 func styledInfo(_ row: Row) -> NSAttributedString {
     let s = NSMutableAttributedString()
     let st = row.status
@@ -505,7 +559,25 @@ func styledInfo(_ row: Row) -> NSAttributedString {
         if let r = w.resets_at { parts.append(("  ↺\(countdown(r)) · \(clockText(r))", inkDim)) }
         s.append(pillLine(parts, w.label == "5h" ? pill5h : pill7d))
     }
-    var plain = ["Agent: \(row.agent)"]
+    if let sub = row.subagents {
+        var parts: [(String, NSColor)] = []
+        if !sub.running.isEmpty { parts.append(("⑂ \(sub.running.count) running", inkText)) }
+        if sub.done > 0 { parts.append((parts.isEmpty ? "⑂ \(sub.done) done" : " · \(sub.done) done", inkDim)) }
+        let head = NSMutableAttributedString(attributedString: pillLine(parts, pillSub))
+        head.addAttribute(subTag, value: -1, range: NSRange(location: 0, length: head.length))
+        s.append(head)
+        let font = NSFont.systemFont(ofSize: fs(12))
+        for (i, r) in sub.running.prefix(3).enumerated() {
+            s.append(NSAttributedString(string: "▸ \(subagentTitle(r)) (\(shortAge(r.since)))\n", attributes: [
+                .font: font, .foregroundColor: NSColor.labelColor, subTag: i]))
+        }
+        if sub.running.count > 3 {
+            s.append(NSAttributedString(string: "▸ and \(sub.running.count - 3) more\n", attributes: [
+                .font: font, .foregroundColor: NSColor.labelColor, subTag: -1]))
+        }
+    }
+    var plain = [String]()
+    plain.append("Agent: \(row.agent)")
     if let h = row.host { plain.append("Host: \(h)" + (row.place.map { " (tmux \($0))" } ?? "")) }
     if let c = row.cpu { plain.append("CPU: \(Int(c.rounded()))% (with its MCP servers and commands)") }
     if let mb = row.mem_mb { plain.append("Memory: \(Int(mb)) MB") }
@@ -683,6 +755,9 @@ final class RowView: NSView {
         var label = row.name
         if let d = row.detail, !d.isEmpty, row.state == "waiting", row.resets_at == nil {
             label += "  — \(d)"  // a usage limit shows on the agent mark's frame instead (styledInfo)
+        }
+        if let n = row.subagents?.running.count, n > 0, row.state != "waiting" {
+            label += "  — \(n) subagent\(n > 1 ? "s" : "")"
         }
         var nameW = bounds.width - rightW - pad * 2 - fs(40)
         if let c = cursor {  // the hover icons take the end of the name's space
@@ -875,6 +950,15 @@ final class Controller: NSObject, NSSearchFieldDelegate {
                         backing: .buffered, defer: true)
     let previewText = NSTextField(wrappingLabelWithString: "")
     var previewKey: String?
+    // Agent info frame: it stays while the cursor crosses to it, and can open the subagent frame.
+    var infoSession: String?   // the row it shows; nil: the frame shows something else
+    var infoText: NSAttributedString?  // what it shows, with the subagent line tags
+    var infoLeft: Date?        // when the cursor left the mark and the frames
+    var markSince: Date?       // when the cursor came on the agent mark
+    var subPick: Int?          // the subagent frame shows this (see styledSubagents); nil: closed
+    let subFrame = Panel(contentRect: .zero, styleMask: [.nonactivatingPanel, .borderless],
+                         backing: .buffered, defer: true)
+    let subText = NSTextField(wrappingLabelWithString: "")
     // Search mode
     let searchIcon = NSButton()
     let searchField = NSSearchField()
@@ -1201,6 +1285,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         if alwaysExpanded && previewForced { updatePreview(); return }
         if searchMode { updatePreview(); return }  // typing: keep the list open
         if panel.frame.contains(NSEvent.mouseLocation) { outsideSince = nil; checkFoldHover(); updatePreview(); return }
+        if infoFrameHolds() { outsideSince = nil; updatePreview(); return }
         hidePreview()
         if alwaysExpanded { return }
         let now = Date()
@@ -1254,12 +1339,17 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     }
 
     func setUpPreview() {
-        preview.level = .statusBar
-        preview.collectionBehavior = [.ignoresCycle]
-        preview.isOpaque = false
-        preview.backgroundColor = .clear
-        preview.hasShadow = true
+        setUpFrame(preview, previewText, lines: 20)
+        setUpFrame(subFrame, subText, lines: 34)
         preview.ignoresMouseEvents = true
+    }
+
+    func setUpFrame(_ frame: Panel, _ label: NSTextField, lines: Int) {
+        frame.level = .statusBar
+        frame.collectionBehavior = [.ignoresCycle]
+        frame.isOpaque = false
+        frame.backgroundColor = .clear
+        frame.hasShadow = true
         let back = NSVisualEffectView()
         back.material = .hudWindow
         back.state = .active
@@ -1267,10 +1357,74 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         back.wantsLayer = true
         back.layer?.cornerRadius = 9
         back.layer?.masksToBounds = true
-        preview.contentView = back
-        previewText.maximumNumberOfLines = 20
-        previewText.cell?.truncatesLastVisibleLine = true
-        back.addSubview(previewText)
+        frame.contentView = back
+        label.maximumNumberOfLines = lines
+        label.cell?.truncatesLastVisibleLine = true
+        back.addSubview(label)
+    }
+
+    func onInfoFrames(_ mouse: NSPoint) -> Bool {
+        preview.frame.contains(mouse) || (subFrame.isVisible && subFrame.frame.contains(mouse))
+    }
+
+    /// The info frame stays: the cursor is on it, or left the agent mark less than keepOpenS ago.
+    func infoFrameHolds() -> Bool {
+        guard infoSession != nil, preview.isVisible else { return false }
+        return onInfoFrames(NSEvent.mouseLocation) || infoLeft.map { Date().timeIntervalSince($0) < keepOpenS } ?? true
+    }
+
+    /// The subagent line of the info frame under the cursor: its index, -1 = all, nil = none.
+    func subLine(at mouse: NSPoint) -> Int? {
+        guard let s = infoText, s.length > 0, preview.frame.contains(mouse) else { return nil }
+        let storage = NSTextStorage(attributedString: s)
+        let layout = NSLayoutManager()
+        storage.addLayoutManager(layout)
+        let box = NSTextContainer(size: NSSize(width: previewText.frame.width - 4, height: .greatestFiniteMagnitude))
+        box.lineFragmentPadding = 0
+        layout.addTextContainer(box)
+        let p = NSPoint(x: mouse.x - preview.frame.minX - previewText.frame.minX - 2,
+                        y: preview.frame.maxY - mouse.y - pad)
+        guard p.y >= 0, p.y < layout.usedRect(for: box).maxY else { return nil }
+        return s.attribute(subTag, at: layout.characterIndexForGlyph(at: layout.glyphIndex(for: p, in: box)),
+                           effectiveRange: nil) as? Int
+    }
+
+    /// Open, change or close the subagent frame. A subagent line under the cursor picks what it
+    /// shows; subAutoS on the agent mark opens it with all. It then stays until the info frame goes.
+    func updateSubFrame(_ row: Row, onMark: Bool) {
+        if let hit = subLine(at: NSEvent.mouseLocation) {
+            subPick = hit
+        } else if onMark, subPick == nil, let since = markSince, Date().timeIntervalSince(since) >= subAutoS {
+            subPick = -1
+        }
+        guard let pick = subPick, let sub = row.subagents else { hideSubFrame(); return }
+        let s = styledSubagents(sub, pick)
+        if s.length == 0 { hideSubFrame(); return }
+        if subFrame.isVisible && subText.stringValue == s.string { return }
+        subText.attributedStringValue = s
+        subText.preferredMaxLayoutWidth = fs(subWidth)
+        let size = NSSize(width: fs(subWidth) + pad * 2 + 4, height: min(fs(480), subText.fittingSize.height) + pad * 2)
+        let vis = (panel.screen ?? NSScreen.main ?? NSScreen.screens[0]).visibleFrame
+        let onRight = preview.frame.minX > panel.frame.minX  // away from the list
+        var x = onRight ? preview.frame.maxX + 6 : preview.frame.minX - 6 - size.width
+        var y = preview.frame.maxY - size.height
+        if x < vis.minX || x + size.width > vis.maxX {  // no room beside it: below it
+            x = max(vis.minX, min(preview.frame.minX, vis.maxX - size.width))
+            y = preview.frame.minY - 6 - size.height
+        }
+        subFrame.setFrame(NSRect(x: x, y: max(vis.minY, y), width: size.width, height: size.height), display: false)
+        subText.frame = NSRect(x: pad + 2, y: pad, width: size.width - pad * 2 - 4, height: size.height - pad * 2)
+        subFrame.orderFrontRegardless()
+    }
+
+    func hideSubFrame() {
+        if subFrame.isVisible { subFrame.orderOut(nil) }
+    }
+
+    func infoFrameText(_ row: Row, _ info: NSAttributedString) -> NSAttributedString {
+        let s = NSMutableAttributedString(attributedString: text(row.name + "\n", .labelColor, bold: true))
+        s.append(info)
+        return s
     }
 
     /// The mouse is on a waiting row (or a chat match in search mode): show its question beside the list (left of the panel, or
@@ -1280,11 +1434,31 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         let inList = scroll.convert(inWindow, from: nil)
         let p = scroll.bounds.contains(inList) ? listView.convert(inWindow, from: nil) : NSPoint(x: -1, y: -1)
         let forced = !(alwaysExpanded && previewForced) ? nil : forcedInfo
-            ? rowViews.first(where: { $0.row.hot == true }) ?? rowViews.first
+            ? rowViews.first(where: { $0.row.subagents != nil }) ?? rowViews.first(where: { $0.row.hot == true }) ?? rowViews.first
             : rowViews.first(where: { forcedPeek ? $0.row.state != "waiting" : $0.row.state == "waiting" })
-        guard expanded, panel.isVisible,
-              let rv = forced ?? rowViews.first(where: { $0.frame.contains(p) })
-        else { hidePreview(); return }
+        let mouse = NSEvent.mouseLocation
+        let under = rowViews.first(where: { $0.frame.contains(p) })
+        // The cursor left the agent mark: keep the info frame, while it stays on the frames or for
+        // keepOpenS on its way there (another row's mark takes over at once).
+        if forced == nil, expanded, panel.isVisible, preview.isVisible, let held = infoSession,
+           onInfoFrames(mouse) || !(under.map { markHitRange($0.row, width: $0.frame.width).contains(p.x) } ?? false) {
+            infoLeft = onInfoFrames(mouse) ? nil : infoLeft ?? Date()
+            markSince = nil
+            if infoFrameHolds() {
+                guard let rv = rowViews.first(where: { $0.row.session == held }) else { hidePreview(); return }
+                let info = styledInfo(rv.row)
+                if held + info.string != previewKey {
+                    previewKey = held + info.string
+                    infoText = infoFrameText(rv.row, info)
+                    showPreview(infoText!, rv, mono: false, keepPlace: true)
+                }
+                updateSubFrame(rv.row, onMark: false)
+                return
+            }
+            hideInfoFrame()
+        }
+        infoLeft = nil
+        guard expanded, panel.isVisible, let rv = forced ?? under else { hidePreview(); return }
         // Search mode: a chat match shows the whole matched line. A waiting agent: its question.
         // Any other row: after 0.35 s on it, "peek" = the last lines of the tab's screen.
         let onMark = forced != nil ? forcedInfo : markHitRange(rv.row, width: rv.frame.width).contains(p.x)
@@ -1299,27 +1473,51 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             body = lines.isEmpty ? "(empty screen)" : lines.joined(separator: "\n")
             mono = true
         }
-        let key = rv.row.session + body!
-        if key == previewKey && preview.isVisible { return }
-        previewKey = key
-        let s = NSMutableAttributedString(attributedString: text(rv.row.name + "\n", .labelColor, bold: true))
         if onMark {
-            s.append(info!)
-        } else {
-            s.append(NSAttributedString(string: body!, attributes: [
-                .font: mono ? NSFont.monospacedSystemFont(ofSize: fs(11), weight: .regular) : NSFont.systemFont(ofSize: fs(12)),
-                .foregroundColor: NSColor.labelColor]))
+            if infoSession != rv.row.session {
+                infoSession = rv.row.session
+                subPick = nil
+                hideSubFrame()
+            }
+            markSince = markSince ?? Date()
+        } else if infoSession != nil {
+            hideInfoFrame()
         }
+        let key = rv.row.session + body!
+        if key != previewKey || !preview.isVisible {
+            previewKey = key
+            preview.ignoresMouseEvents = !onMark
+            if onMark {
+                infoText = infoFrameText(rv.row, info!)
+                showPreview(infoText!, rv, mono: false)
+            } else {
+                let s = NSMutableAttributedString(attributedString: text(rv.row.name + "\n", .labelColor, bold: true))
+                s.append(NSAttributedString(string: body!, attributes: [
+                    .font: mono ? NSFont.monospacedSystemFont(ofSize: fs(11), weight: .regular) : NSFont.systemFont(ofSize: fs(12)),
+                    .foregroundColor: NSColor.labelColor]))
+                showPreview(s, rv, mono: mono)
+            }
+        }
+        if onMark { updateSubFrame(rv.row, onMark: true) }
+    }
+
+    /// keepPlace: the info frame while the cursor goes to it or is on it: its top left corner stays.
+    func showPreview(_ s: NSAttributedString, _ rv: RowView, mono: Bool, keepPlace: Bool = false) {
         previewText.attributedStringValue = s
-        let maxW: CGFloat = mono ? fs(560) : fs(400)
+        let isInfo = infoSession != nil
+        let maxW: CGFloat = isInfo ? fs(infoWidth) : mono ? fs(560) : fs(400)
         previewText.preferredMaxLayoutWidth = maxW
         let fit = previewText.fittingSize
-        let size = NSSize(width: min(maxW, fit.width) + pad * 2 + 4, height: min(fs(340), fit.height) + pad * 2)
+        let size = NSSize(width: (isInfo ? maxW : min(maxW, fit.width)) + pad * 2 + 4, height: min(fs(340), fit.height) + pad * 2)
         let rowTop = min(panel.frame.maxY, panel.convertToScreen(listView.convert(rv.frame, to: nil)).maxY)
         let vis = (panel.screen ?? NSScreen.main ?? NSScreen.screens[0]).visibleFrame
         var x = panel.frame.minX - 6 - size.width
         if x < vis.minX { x = panel.frame.maxX + 6 }
-        let y = max(vis.minY, rowTop - size.height)
+        var y = max(vis.minY, rowTop - size.height)
+        if keepPlace {
+            x = preview.frame.minX
+            y = max(vis.minY, preview.frame.maxY - size.height)
+        }
         preview.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: false)
         previewText.frame = NSRect(x: pad + 2, y: pad, width: size.width - pad * 2 - 4, height: size.height - pad * 2)
         preview.orderFrontRegardless()
@@ -1356,9 +1554,19 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         }
     }
 
+    func hideInfoFrame() {
+        infoSession = nil
+        infoText = nil
+        infoLeft = nil
+        markSince = nil
+        subPick = nil
+        hideSubFrame()
+    }
+
     func hidePreview() {
         hoverRow = nil
         previewKey = nil
+        hideInfoFrame()
         if preview.isVisible { preview.orderOut(nil) }
     }
 

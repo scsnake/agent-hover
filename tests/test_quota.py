@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from agent_hover import quota
@@ -16,15 +17,16 @@ def run_tee(tmp_path, agent, payload, *command):
 
 
 def test_tee_saves_claude_limits_and_runs_the_command(tmp_path, monkeypatch):
+    reset5, reset7 = int(time.time()) + 3600, int(time.time()) + 86400
     payload = {"model": {"id": "claude-opus-5-5"},
-               "rate_limits": {"five_hour": {"used_percentage": 16, "resets_at": 1793506800},
-                               "seven_day": {"used_percentage": 35.5, "resets_at": 1793703600}}}
+               "rate_limits": {"five_hour": {"used_percentage": 16, "resets_at": reset5},
+                               "seven_day": {"used_percentage": 35.5, "resets_at": reset7}}}
     r = run_tee(tmp_path, "claude", payload, "sh", "-c", "cat | wc -c")
     assert r.returncode == 0 and int(r.stdout) == len(json.dumps(payload))  # same input, its output only
     monkeypatch.setattr(quota, "QUOTA_DIR", tmp_path / "quota")
-    q = quota.claude_quota(now=0)
-    assert q["windows"] == [{"label": "5h", "used": 16.0, "resets_at": 1793506800},
-                            {"label": "7d", "used": 35.5, "resets_at": 1793703600}]
+    q = quota.claude_quota()
+    assert q["windows"] == [{"label": "5h", "used": 16.0, "resets_at": reset5},
+                            {"label": "7d", "used": 35.5, "resets_at": reset7}]
 
 
 def test_tee_never_fails_the_status_line(tmp_path):
@@ -94,8 +96,6 @@ def test_codex_status_from_session_tail():
 
 
 def test_idle_claude_session_does_not_replace_newer_limits(tmp_path, monkeypatch):
-    import time
-
     now = time.time()
     monkeypatch.setattr(quota, "QUOTA_DIR", tmp_path / "quota")
 

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import iterm2
 
-from agent_hover import agents, commands, quota, remote, search, states
+from agent_hover import agents, commands, quota, remote, search, states, subagents
 from agent_hover.agents import (CLAUDE_SESSIONS, CLAUDE_STATUS, CODEX_PIDS, as_pid, child_map,  # noqa: F401
                                claude_session, clean_name, codex_main_rollout, codex_turn_update,
                                agy_conversation, detect_agent, process_table, seed_record, title_state,
@@ -49,6 +49,7 @@ GROUP_ORDER = {states.WAITING: 0, states.DONE: 1, states.WORKING: 2, states.IDLE
 SEED_SCAN_S = 5.0
 ENDED_GRACE_S = 10.0  # an agent that wrote SessionEnd may still be the tab's job for a moment
 QUOTA_SCAN_S = 30.0  # usage limits for the hover frame: local files only, no request
+SUBAGENT_SCAN_S = 5.0  # running subagents keep a tab working: local files only
 AGENT_GONE_S = 60.0  # a hook record with no agent in its tab this long: the agent quit without SessionEnd
 
 
@@ -660,6 +661,7 @@ async def run(conn, args):
     codex_paths, codex_ts = {}, 0.0  # Codex session ID -> its session file
     agy_ts = 0.0
     quotas, quota_ts = {}, 0.0  # session -> usage limits of its agent (quota.py)
+    subs, subs_ts, held, listed = {}, 0.0, set(), []  # session -> its subagents (subagents.py)
     statuses = {}  # session -> model, effort and context use of its agent session (quota.py)
     daemon_cfg = states.load_config().get("daemon")
     notify_reset = not (isinstance(daemon_cfg, dict) and daemon_cfg.get("notify_limit_reset") is False)
@@ -690,7 +692,15 @@ async def run(conn, args):
                     log("state_pruned", session=sid)
             parts["seed"] = time.monotonic() - t
             seed_ts = now
-        recs = states.read_states()
+        real = states.read_states()
+        if now - subs_ts > SUBAGENT_SCAN_S:
+            subs_ts = now
+            subs = await asyncio.to_thread(subagents.scan, {s: real[s] for s in listed if s in real}, now)
+        recs = subagents.overlay(real, subs)  # write state files only from real, not from recs
+        now_held = {sid for sid, r in recs.items() if r is not real[sid]}
+        for sid in now_held ^ held:
+            log("subagents_hold" if sid in now_held else "subagents_release", session=sid)
+        held = now_held
         where, counts = layout(app)
         buried_now = {s.session_id for s in app.buried_sessions}
         ours = load_buried()
@@ -708,7 +718,7 @@ async def run(conn, args):
             if recs.get(sid, {}).get("state") != pinned[sid]:
                 pinned.pop(sid)
         for sid in list(hidden):
-            state = recs.get(sid, {}).get("state")
+            state = real.get(sid, {}).get("state")
             if state != hidden[sid]:
                 hidden.pop(sid)  # it waits, ends its turn, or starts work: show it by the rules
                 if state == states.IDLE:
@@ -791,7 +801,7 @@ async def run(conn, args):
         if now - codex_ts > CODEX_SCAN_S:
             codex_ts = now
             for sid in listed:
-                rec = recs[sid]
+                rec = real.get(sid, recs[sid])
                 if rec.get("agent") != "codex" or rec.get("state") != states.WORKING or not rec.get("agent_session"):
                     continue
                 aid = rec["agent_session"]
@@ -923,6 +933,7 @@ async def run(conn, args):
                       "pinned": sid in pins, "hidden": sid in hidden, "model": models.get(sid, (0, None))[1],
                       "cpu": usage.get(sid, (None, None))[0], "mem_mb": usage.get(sid, (None, None))[1],
                       "hot": hot.get(sid, False), "quota": quotas.get(sid), "status": statuses.get(sid),
+                      "subagents": subs.get(sid),
                       "unseen": recs[sid]["state"] == states.DONE and not focus.has(sid)
                                 and last_focus.get(sid, 0) < recs[sid]["ts"]} for sid in listed] + far_rows,
                     args.apply, update=bool(update_on and update.get("available")))
