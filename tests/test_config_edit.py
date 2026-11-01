@@ -103,3 +103,40 @@ def test_restore_after_partial_install(tmp_path, monkeypatch):
     monkeypatch.setattr(ce, "write", real_write)
     ce.cmd_restore(apply=True, force=False, backup=None)  # manifest exists although install crashed
     assert (claude.read_bytes(), codex.read_bytes()) == before
+
+
+def test_statusline_wrapper_round_trip():
+    orig = {"statusLine": {"type": "command", "command": "bash '/x/statusline.sh' | cat", "refreshInterval": 60}}
+    wrapped = ce.statusline_with_ours(json.loads(json.dumps(orig)), "claude")
+    cmd = wrapped["statusLine"]["command"]
+    assert ce.QUOTA_TAG in cmd and cmd.endswith("-- sh -c 'bash '\"'\"'/x/statusline.sh'\"'\"' | cat'")
+    assert wrapped["statusLine"]["refreshInterval"] == 60
+    assert ce.statusline_with_ours(json.loads(json.dumps(wrapped)), "claude") == wrapped  # twice = once
+    assert ce.statusline_without_ours(wrapped) == orig
+    assert ce.statusline_with_ours({"model": "x"}, "agy") == {"model": "x"}  # no status line: none added
+    fresh = ce.statusline_with_ours(json.loads(json.dumps(orig)), "claude")
+    edited = {"statusLine": {**fresh["statusLine"], "command": fresh["statusLine"]["command"] + " | tee /tmp/x"}}
+    assert ce.statusline_without_ours(json.loads(json.dumps(edited))) == edited  # edited: left as it is
+    assert ce.statusline_with_ours(json.loads(json.dumps(edited)), "claude") == edited  # not wrapped twice
+    broken = {"statusLine": {**fresh["statusLine"], "command": fresh["statusLine"]["command"] + " 'x"}}
+    assert ce.statusline_without_ours(json.loads(json.dumps(broken))) == broken  # unbalanced quote: no crash
+
+
+def test_install_backs_up_two_settings_files(tmp_path, monkeypatch):
+    claude, agy = tmp_path / "claude" / "settings.json", tmp_path / "agy" / "settings.json"
+    for p, cmd in ((claude, "claude-line"), (agy, "agy-line")):
+        p.parent.mkdir()
+        p.write_text(json.dumps({"statusLine": {"type": "command", "command": cmd}}))
+    monkeypatch.setattr(ce, "CLAUDE_FILE", claude)
+    monkeypatch.setattr(ce, "CODEX_FILE", tmp_path / "none.toml")
+    monkeypatch.setattr(ce, "AGY_SETTINGS", agy)
+    monkeypatch.setattr(ce.states, "BACKUP_DIR", tmp_path / "backup")
+    ce.cmd_install(True)
+    assert ce.QUOTA_TAG in json.loads(agy.read_text())["statusLine"]["command"]
+    (bdir,) = (tmp_path / "backup").iterdir()
+    manifest = json.loads((bdir / "manifest.json").read_text())
+    assert {json.loads(open(v["backup"]).read())["statusLine"]["command"] for v in manifest.values()} == {
+        "claude-line", "agy-line"}
+    ce.cmd_uninstall(True)
+    assert json.loads(agy.read_text())["statusLine"]["command"] == "agy-line"
+    assert json.loads(claude.read_text())["statusLine"]["command"] == "claude-line"

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import iterm2
 
-from agent_hover import agents, commands, remote, search, states
+from agent_hover import agents, commands, quota, remote, search, states
 from agent_hover.agents import (CLAUDE_SESSIONS, CLAUDE_STATUS, CODEX_PIDS, as_pid, child_map,  # noqa: F401
                                claude_session, clean_name, codex_main_rollout, codex_turn_update,
                                agy_conversation, detect_agent, process_table, seed_record, title_state,
@@ -48,6 +48,7 @@ PINS_FILE = states.HOME / "pins.json"  # tabs pinned in the panel: never parked
 GROUP_ORDER = {states.WAITING: 0, states.DONE: 1, states.WORKING: 2, states.IDLE: 3}
 SEED_SCAN_S = 5.0
 ENDED_GRACE_S = 10.0  # an agent that wrote SessionEnd may still be the tab's job for a moment
+QUOTA_SCAN_S = 30.0  # usage limits for the hover frame: local files only, no request
 AGENT_GONE_S = 60.0  # a hook record with no agent in its tab this long: the agent quit without SessionEnd
 
 
@@ -616,7 +617,7 @@ def remote_panel_rows(hosts, now, started, focus_tag, last_focus, pins, done_at,
                         "detail": r.get("detail", ""), "question": r.get("question"), "resets_at": resets,
                         "since": r["since"], "last": r["since"], "buried": False, "focused": focused,
                         "pinned": sid in pins, "model": r.get("model"), "cpu": r.get("cpu"),
-                        "mem_mb": r.get("mem_mb"), "hot": False,
+                        "mem_mb": r.get("mem_mb"), "hot": False, "quota": r.get("quota"), "status": r.get("status"),
                         "unseen": state == states.DONE and not focused and lf < r["since"],
                         "host": h.name, "place": f"{r['tmux_session']}:{r['window']}"})
     return out
@@ -658,6 +659,8 @@ async def run(conn, args):
     usage, hot, hot_since, usage_ts = {}, {}, {}, 0.0  # session -> (cpu, MB) / bool / time hot began
     codex_paths, codex_ts = {}, 0.0  # Codex session ID -> its session file
     agy_ts = 0.0
+    quotas, quota_ts = {}, 0.0  # session -> usage limits of its agent (quota.py)
+    statuses = {}  # session -> model, effort and context use of its agent session (quota.py)
     daemon_cfg = states.load_config().get("daemon")
     notify_reset = not (isinstance(daemon_cfg, dict) and daemon_cfg.get("notify_limit_reset") is False)
     update_on = states.load_config().get("update_check") is True
@@ -880,6 +883,30 @@ async def run(conn, args):
                 path = search.transcript(recs[sid].get("agent", ""), recs[sid].get("agent_session"))
                 # agy names its model in each hook event (no transcript lookup here)
                 models[sid] = (now, search.transcript_model(path) if path else recs[sid].get("model"))
+        if now - quota_ts > QUOTA_SCAN_S:
+            quota_ts = now
+            # Limits are per account: Claude and Codex rows show the newest data any of their tabs
+            # has; agy limits depend on the model.
+            claude_q, codex_q = quota.claude_quota(), None
+            for sid in listed:
+                aid = recs[sid].get("agent_session")
+                if recs[sid].get("agent") == "codex" and aid:
+                    if not codex_paths.get(aid):
+                        codex_paths[aid] = states.codex_rollout(aid)
+                    q = quota.codex_quota_file(codex_paths[aid]) if codex_paths[aid] else None
+                    if q and (codex_q is None or (q["ts"] or 0) > (codex_q["ts"] or 0)):
+                        codex_q = q
+            statuses = {}
+            for sid in listed:
+                agent, aid = recs[sid].get("agent"), recs[sid].get("agent_session")
+                if agent == "codex" and codex_paths.get(aid):
+                    statuses[sid] = quota.codex_status_file(codex_paths[aid])
+                elif agent in ("claude", "agy"):
+                    statuses[sid] = quota.session_status(agent, aid)
+            quota.prune_status(now)
+            quotas = {sid: claude_q if recs[sid].get("agent") == "claude" else codex_q
+                      if recs[sid].get("agent") == "codex" else quota.agy_quota(models.get(sid, (0, None))[1])
+                      if recs[sid].get("agent") == "agy" else None for sid in listed}
         focus_tag = (await remote_tag(app.get_session_by_id(focus.session), remote_tabs)
                      if hosts and focus.session and focus.app_active and app.get_session_by_id(focus.session) else "")
         far_rows = remote_panel_rows(hosts, now, started, focus_tag, last_focus, pins, remote_done,
@@ -895,7 +922,7 @@ async def run(conn, args):
                       "buried": sid in buried_now, "focused": focus.has(sid),
                       "pinned": sid in pins, "hidden": sid in hidden, "model": models.get(sid, (0, None))[1],
                       "cpu": usage.get(sid, (None, None))[0], "mem_mb": usage.get(sid, (None, None))[1],
-                      "hot": hot.get(sid, False),
+                      "hot": hot.get(sid, False), "quota": quotas.get(sid), "status": statuses.get(sid),
                       "unseen": recs[sid]["state"] == states.DONE and not focus.has(sid)
                                 and last_focus.get(sid, 0) < recs[sid]["ts"]} for sid in listed] + far_rows,
                     args.apply, update=bool(update_on and update.get("available")))

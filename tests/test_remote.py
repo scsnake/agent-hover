@@ -104,6 +104,7 @@ def test_rows_from_scan():
     x = rows["tmux-2538-5"]
     assert (x["agent"], x["state"], x["detail"]) == ("codex", states.WAITING, "usage limit")
     assert x["resets_at"] == NOW + 600 and x["question"].startswith("Codex hit its usage limit.")
+    assert [w["used"] for w in x["quota"]["windows"]] == [99.0, 40.0]
     assert x["name"] == "other" and x["cwd"] == "/data/other" and not x["active"]  # title is the host name
 
 

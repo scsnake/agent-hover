@@ -22,6 +22,7 @@ Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs
 | Question preview | A waiting agent has an orange `?`. Hover its row to see the question: the command to approve, the choices, or the plan |
 | Peek | Hover any other row to see the last lines of that tab's screen, without switching to it |
 | CPU and memory | Hover the agent mark at the right end of a row: the frame shows the agent, model, CPU and memory (instead of the screen) of the agent and the commands it runs. A red flame marks an agent that is not working but uses much CPU (stuck, or a command still running) |
+| Quota | The same frame shows, one line each in the style of the [coralline](https://github.com/Nanako0129/coralline) status line: the model, the effort, the context window use (gauge, %, tokens in and out), and the usage limits 5h and 7d (gauge, %, time to reset and reset time), with "as of ..." when the data is older than 10 min. No request is sent: Codex writes its limits to its session file after each turn; Claude Code and agy send them to their status-line command, so the install puts a small wrapper (`quota_tee.py`) in front of that command. It saves the limits and runs the same command. With no status line set, Claude and agy show no quota (Claude: unless the coralline status line keeps its limit store) |
 | "New" dot | A blue dot marks a done tab that you have not looked at yet |
 | Pin | Hover a row and click the pin icon at its end (or right-click → **Pin**). A pinned tab is never hidden and is listed first |
 | Hide now | Hover a row and click the eye-slash icon (or right-click → **Hide now**). The tab is hidden at once, also the tab you use. It comes back when its state changes (it waits for you, or ends its turn), or when you click its row. Hiding a pinned tab unpins it. Not in dry run |
@@ -52,7 +53,7 @@ Keep only a few AI coding agent tabs visible in **iTerm2**. The other agent tabs
    ```sh
    ./install.sh
    ```
-3. Add the hooks. This first backs up `~/.claude/settings.json`, `~/.codex/config.toml` and (if agy is installed) `~/.gemini/config/hooks.json`:
+3. Add the hooks and the status-line wrapper. This first backs up `~/.claude/settings.json`, `~/.codex/config.toml` and (if agy is installed) `~/.gemini/config/hooks.json` and `~/.gemini/antigravity-cli/settings.json`:
    ```sh
    ./install.sh --apply
    ```

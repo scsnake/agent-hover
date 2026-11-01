@@ -114,6 +114,27 @@ struct Row: Decodable {
     let resets_at: Double? // waiting on a Codex usage limit: when it resets (Unix time)
     let host: String?      // an agent in a tmux pane of a remote host (config.json "remote"): the host
     let place: String?     // that pane's tmux session and window, e.g. "a:3"
+    let quota: Quota?      // the agent's usage limits (daemon quota.py), as of quota.ts
+    let status: AgentStatus?  // model, effort and context use of the agent session (quota.py)
+}
+
+struct AgentStatus: Decodable {
+    let model: String?
+    let effort: String?
+    let ctx: Double?       // context window used, percent
+    let tok_in: Double?
+    let tok_out: Double?
+    let ts: Double?
+}
+
+struct Quota: Decodable {
+    struct Window: Decodable {
+        let label: String     // "5h", "7d"
+        let used: Double      // percent
+        let resets_at: Double?
+    }
+    let windows: [Window]
+    let ts: Double?           // time of the data: the agent's last turn or status line
 }
 
 struct Snapshot: Decodable {
@@ -417,15 +438,88 @@ func pinIcon() -> NSImage? {
 /// The hover frame's text when the cursor is on a row's agent mark (or its flame): agent, model,
 /// CPU and memory. Not a tooltip: the rows are rebuilt each second, and the panel never takes
 /// focus, so macOS tooltips do not show.
-func rowInfo(_ row: Row) -> String {
-    var lines = ["Agent: \(row.agent)"]
-    if let h = row.host { lines.append("Host: \(h)" + (row.place.map { " (tmux \($0))" } ?? "")) }
-    if let m = row.model { lines.append("Model: \(m)") }
-    if let c = row.cpu { lines.append("CPU: \(Int(c.rounded()))% (with its MCP servers and commands)") }
-    if let mb = row.mem_mb { lines.append("Memory: \(Int(mb)) MB") }
-    if row.hot == true { lines.append("High CPU while not working: stuck, or a command still running") }
-    if row.state == "waiting", let r = row.resets_at { lines.append(limitText(r)) }
-    return lines.joined(separator: "\n")
+// The hover frame on the agent mark, in the style of the coralline status line: one pill per
+// line (model, effort, context, 5h, 7d) with its colors (theme claude-coral), gauges ▰▱ and
+// the same green / yellow / red at 50 % and 75 %. The other facts follow as plain lines.
+func xterm(_ hex: UInt32) -> NSColor {
+    NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
+            blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+}
+
+let pillModel = xterm(0xD7875F), pillEffort = xterm(0xAF87FF), pillCtx = xterm(0x444444)
+let pill5h = xterm(0x3A3A3A), pill7d = xterm(0x303030)
+let inkText = xterm(0xFFFFFF), inkDim = xterm(0x8A8A8A)
+
+func gaugeInk(_ pct: Double) -> NSColor { pct >= 75 ? xterm(0xD75F5F) : pct >= 50 ? xterm(0xD7AF5F) : xterm(0x87D787) }
+
+func gaugeBar(_ pct: Double, width: Int = 5) -> String {
+    let filled = max(0, min(width, Int((pct * Double(width) + 50) / 100)))
+    return String(repeating: "▰", count: filled) + String(repeating: "▱", count: width - filled)
+}
+
+func tokens(_ n: Double) -> String {
+    n >= 1_000_000 ? String(format: "%.1fM", n / 1_000_000) : n >= 1000 ? String(format: "%.1fk", n / 1000) : "\(Int(n))"
+}
+
+/// "22m", "1h05m", "2d07h" until t; "now" when past.
+func countdown(_ t: Double) -> String {
+    let diff = Int(t - Date().timeIntervalSince1970)
+    if diff <= 0 { return "now" }
+    let d = diff / 86400, h = diff % 86400 / 3600, m = diff % 3600 / 60
+    return d > 0 ? String(format: "%dd%02dh", d, h) : h > 0 ? String(format: "%dh%02dm", h, m) : "\(m)m"
+}
+
+func clockText(_ t: Double) -> String {
+    let f = DateFormatter()
+    f.dateFormat = abs(t - Date().timeIntervalSince1970) > 20 * 3600 ? "EEE HH:mm" : "HH:mm"
+    return f.string(from: Date(timeIntervalSince1970: t))
+}
+
+/// One pill line: [(text, ink)] on one background.
+func pillLine(_ parts: [(String, NSColor)], _ bg: NSColor, bold: Bool = false) -> NSAttributedString {
+    let s = NSMutableAttributedString()
+    let font = NSFont.monospacedSystemFont(ofSize: fs(11.5), weight: bold ? .bold : .regular)
+    for (t, ink) in [(" ", inkText)] + parts + [(" ", inkText)] {
+        s.append(NSAttributedString(string: t, attributes: [.font: font, .foregroundColor: ink, .backgroundColor: bg]))
+    }
+    s.append(NSAttributedString(string: "\n", attributes: [.font: font]))
+    return s
+}
+
+func styledInfo(_ row: Row) -> NSAttributedString {
+    let s = NSMutableAttributedString()
+    let st = row.status
+    if let m = st?.model ?? row.model { s.append(pillLine([("◆ " + m.replacingOccurrences(of: "Claude ", with: ""), inkText)], pillModel, bold: true)) }
+    if let e = st?.effort { s.append(pillLine([("ψ " + e, inkText)], pillEffort)) }
+    if let c = st?.ctx, c > 0 || (st?.tok_in ?? 0) > 0 {  // empty: no request yet (coralline hides it too)
+        var parts: [(String, NSColor)] = [("⬡ \(gaugeBar(c)) \(Int(c.rounded()))%", gaugeInk(c))]
+        if let i = st?.tok_in, let o = st?.tok_out { parts.append(("  ↑\(tokens(i)) ↓\(tokens(o))", inkDim)) }
+        s.append(pillLine(parts, pillCtx))
+    }
+    for w in row.quota?.windows ?? [] {
+        if let r = w.resets_at, r <= Date().timeIntervalSince1970 {  // its use is no longer known
+            s.append(pillLine([("\(w.label) reset at \(clockText(r))", inkDim)], w.label == "5h" ? pill5h : pill7d))
+            continue
+        }
+        var parts: [(String, NSColor)] = [("\(w.label) \(gaugeBar(w.used)) \(Int(w.used.rounded()))%", gaugeInk(w.used))]
+        if let r = w.resets_at { parts.append(("  ↺\(countdown(r)) · \(clockText(r))", inkDim)) }
+        s.append(pillLine(parts, w.label == "5h" ? pill5h : pill7d))
+    }
+    var plain = ["Agent: \(row.agent)"]
+    if let h = row.host { plain.append("Host: \(h)" + (row.place.map { " (tmux \($0))" } ?? "")) }
+    if let c = row.cpu { plain.append("CPU: \(Int(c.rounded()))% (with its MCP servers and commands)") }
+    if let mb = row.mem_mb { plain.append("Memory: \(Int(mb)) MB") }
+    if row.hot == true { plain.append("High CPU while not working: stuck, or a command still running") }
+    if row.state == "waiting", let r = row.resets_at { plain.append(limitText(r)) }
+    let now = Date().timeIntervalSince1970
+    if let ts = row.quota?.ts, now - ts > 600 { plain.append("Quota as of \(clockText(ts))") }
+    if let ts = st?.ts, now - ts > 600, st?.ctx != nil { plain.append("Context as of \(clockText(ts))") }
+    let para = NSMutableParagraphStyle()
+    para.paragraphSpacing = 3
+    s.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: s.length))
+    s.append(NSAttributedString(string: plain.joined(separator: "\n"), attributes: [
+        .font: NSFont.systemFont(ofSize: fs(12)), .foregroundColor: NSColor.labelColor]))
+    return s
 }
 
 /// The x range (row coordinates) of a row's agent mark, and of the flame and host marks left of it
@@ -588,7 +682,7 @@ final class RowView: NSView {
         }
         var label = row.name
         if let d = row.detail, !d.isEmpty, row.state == "waiting", row.resets_at == nil {
-            label += "  — \(d)"  // a usage limit shows on the agent mark's frame instead (rowInfo)
+            label += "  — \(d)"  // a usage limit shows on the agent mark's frame instead (styledInfo)
         }
         var nameW = bounds.width - rightW - pad * 2 - fs(40)
         if let c = cursor {  // the hover icons take the end of the name's space
@@ -1195,7 +1289,8 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         // Any other row: after 0.35 s on it, "peek" = the last lines of the tab's screen.
         let onMark = forced != nil ? forcedInfo : markHitRange(rv.row, width: rv.frame.width).contains(p.x)
         let chatLine = searchMode ? rv.note.flatMap { $0.hasPrefix("“") ? $0 : nil } : nil
-        var body = onMark ? rowInfo(rv.row) : chatLine ?? (rv.row.state == "waiting"
+        let info = onMark ? styledInfo(rv.row) : nil  // its text (with countdowns) is the change key
+        var body = onMark ? info!.string : chatLine ?? (rv.row.state == "waiting"
             ? rv.row.question ?? (rv.row.detail.flatMap { $0.isEmpty ? nil : "Waiting for you (\($0))." }
                                   ?? "Waiting for you.") : nil)
         var mono = false
@@ -1208,9 +1303,13 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         if key == previewKey && preview.isVisible { return }
         previewKey = key
         let s = NSMutableAttributedString(attributedString: text(rv.row.name + "\n", .labelColor, bold: true))
-        s.append(NSAttributedString(string: body!, attributes: [
-            .font: mono ? NSFont.monospacedSystemFont(ofSize: fs(11), weight: .regular) : NSFont.systemFont(ofSize: fs(12)),
-            .foregroundColor: NSColor.labelColor]))
+        if onMark {
+            s.append(info!)
+        } else {
+            s.append(NSAttributedString(string: body!, attributes: [
+                .font: mono ? NSFont.monospacedSystemFont(ofSize: fs(11), weight: .regular) : NSFont.systemFont(ofSize: fs(12)),
+                .foregroundColor: NSColor.labelColor]))
+        }
         previewText.attributedStringValue = s
         let maxW: CGFloat = mono ? fs(560) : fs(400)
         previewText.preferredMaxLayoutWidth = maxW

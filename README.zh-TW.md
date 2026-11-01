@@ -22,6 +22,7 @@
 | 問題預覽 | 等待中的代理有橘色 `?`。滑鼠移到該列，會顯示問題內容：要核准的指令、選項或計畫 |
 | 偷看（Peek） | 滑鼠停在其他列上，會顯示該分頁畫面的最後幾行，不必切換過去 |
 | CPU 與記憶體 | 滑鼠停在列右端的代理標記上，小框會改為顯示代理、模型，以及代理和它執行的指令所用的 CPU 與記憶體。代理沒在工作卻用掉很多 CPU 時（卡住，或有指令還在跑），會出現紅色火焰標記 |
+| 用量額度 | 同一個小框也以 [coralline](https://github.com/Nanako0129/coralline) 狀態列的樣式，每項一行顯示：模型、effort、context 用量（量表、百分比、輸入與輸出 token），以及 5h 與 7d 用量額度（量表、百分比、距重置時間與重置時刻）；資料超過 10 分鐘時加上「as of ...」。不會送出任何請求：Codex 每一輪結束會把額度寫進 session 檔；Claude Code 與 agy 會把額度送給狀態列指令，所以安裝時會在該指令前面加一個小包裝程式（`quota_tee.py`），它存下額度後執行原本的指令。沒有設定狀態列時，Claude 與 agy 不顯示額度（Claude：除非 coralline 狀態列有保存額度） |
 | 「新」圓點 | 藍色圓點標示已完成、但你還沒看過的分頁 |
 | 釘選 | 游標移到某列，點列尾的圖釘圖示（或按右鍵 → **Pin**）。釘選的分頁不會被隱藏，並排在最前面 |
 | 立即隱藏 | 游標移到某列，點眼睛斜線圖示（或按右鍵 → **Hide now**）。分頁立即隱藏，正在用的分頁也可以。狀態改變時（等待你，或結束這一輪）或你點該列時，它會回來。隱藏釘選的分頁會取消釘選。乾跑模式不提供 |
@@ -52,7 +53,7 @@
    ```sh
    ./install.sh
    ```
-3. 加入 hook。它會先備份 `~/.claude/settings.json`、`~/.codex/config.toml`，以及（有安裝 agy 時）`~/.gemini/config/hooks.json`：
+3. 加入 hook 與狀態列包裝程式。它會先備份 `~/.claude/settings.json`、`~/.codex/config.toml`，以及（有安裝 agy 時）`~/.gemini/config/hooks.json` 與 `~/.gemini/antigravity-cli/settings.json`：
    ```sh
    ./install.sh --apply
    ```

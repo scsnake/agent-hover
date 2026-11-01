@@ -39,7 +39,7 @@ import threading
 import time
 from pathlib import Path
 
-from agent_hover import agents, states
+from agent_hover import agents, quota, states
 
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")
 PANE_RE = re.compile(r"%\d+")
@@ -411,7 +411,9 @@ def build_rows(parsed, now):
                        "since": float(when) if isinstance(when, (int, float)) else now,
                        "cwd": panes[pane]["pane_current_path"], "path": c["path"],
                        "agent_session": sid if states.UUID_RE.fullmatch(sid) else None,
-                       "resets_at": states.codex_resets_at(None, text=c["tail"]) if detail == "usage limit" else None}
+                       "resets_at": states.codex_resets_at(None, text=c["tail"]) if detail == "usage limit" else None,
+                       "quota": quota.codex_quota(c["tail"], c["mtime"] or None),
+                       "status": quota.codex_status(c["tail"], c["mtime"] or None)}
 
     for pane, p in panes.items():  # an agent with no status file (an older Claude, another agent)
         if pane in found or not p["pane_pid"].isdigit():
@@ -457,7 +459,7 @@ def build_rows(parsed, now):
                      "question": f.get("question") if waiting else None,
                      "resets_at": f.get("resets_at") if waiting else None,
                      "since": f["since"], "agent_session": f.get("agent_session"), "path": f.get("path"),
-                     "screen_state": bool(f.get("screen")),
+                     "screen_state": bool(f.get("screen")), "quota": f.get("quota"), "status": f.get("status"),
                      "cpu": cpu, "mem_mb": mem,
                      "active": p["pane_active"] == "1" and p["window_active"] == "1"
                                and p["session_attached"] not in ("", "0")}

@@ -9,7 +9,10 @@ install   backs up the files (exact bytes) to ~/.agent-hover/backup/<time>/, the
           entries tagged with "agent_hover/hook.py" (in ~/.gemini/config/hooks.json: the
           "agent-hover" entry; the file is made if agy is installed and it is missing).
           Other hooks, cc-status included, stay.
-uninstall removes only the tagged entries; all other later changes stay.
+          The status-line command of Claude Code and of agy (if one is set) gets the
+          quota_tee.py wrapper in front: it saves the usage limits for the panel and runs the
+          same command. No status line set: none is added.
+uninstall removes only the tagged entries and the wrapper; all other later changes stay.
 restore   copies the exact backup back. It refuses if the file changed after install,
           unless --force (later changes would be lost).
 """
@@ -18,6 +21,7 @@ import difflib
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
@@ -35,6 +39,8 @@ CODEX_FILE = Path.home() / ".codex" / "config.toml"
 # agy is installed (~/.gemini/config exists) and the file is missing; restore then removes it.
 AGY_FILE = Path.home() / ".gemini" / "config" / "hooks.json"
 AGY_HOOK_NAME = "agent-hover"
+AGY_SETTINGS = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"  # agy's statusLine
+QUOTA_TAG = "agent_hover/quota_tee.py"
 CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
                  "PostToolUse", "Notification", "Stop", "StopFailure"]
 CODEX_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
@@ -130,6 +136,39 @@ def agy_with_ours(data):
     return data
 
 
+# ---- status line (Claude settings.json, agy settings.json) -------------------------------
+
+def statusline_without_ours(data):
+    """The status-line command as it was before the wrapper."""
+    line = data.get("statusLine")
+    if not (isinstance(line, dict) and QUOTA_TAG in str(line.get("command", ""))):
+        return data
+    try:
+        words = shlex.split(line["command"])
+    except ValueError:  # unbalanced quotes: edited by hand
+        words = None
+    rest = words[words.index("--") + 1:] if words and "--" in words else []
+    if words is not None and not rest:
+        data.pop("statusLine")  # the wrapper alone (none was set before)
+    elif rest[:2] == ["sh", "-c"] and len(rest) == 3:
+        data["statusLine"] = {**line, "command": rest[2]}
+    else:
+        print(f"Note: the status-line command was edited after install; left as it is:\n  {line['command']}")
+    return data
+
+
+def statusline_with_ours(data, agent):
+    """Put quota_tee.py in front of a status-line command (the same command still runs)."""
+    data = statusline_without_ours(data)
+    line = data.get("statusLine")
+    if isinstance(line, dict) and QUOTA_TAG in str(line.get("command", "")):
+        return data  # an edited wrapper: keep it, do not wrap it twice
+    if isinstance(line, dict) and line.get("type", "command") == "command" and isinstance(line.get("command"), str):
+        tee = f"'{python_path()}' -I '{PROJ}/agent_hover/quota_tee.py' {agent}"
+        data["statusLine"] = {**line, "command": f"{tee} -- sh -c {shlex.quote(line['command'])}"}
+    return data
+
+
 # ---- planning and writing ------------------------------------------------------------
 
 def plan(mode):
@@ -138,7 +177,8 @@ def plan(mode):
     if CLAUDE_FILE.exists():
         raw = CLAUDE_FILE.read_bytes()
         old = json.loads(raw)
-        new = claude_with_ours(json.loads(raw)) if mode == "install" else claude_without_ours(json.loads(raw))
+        new = (statusline_with_ours(claude_with_ours(json.loads(raw)), "claude") if mode == "install"
+               else statusline_without_ours(claude_without_ours(json.loads(raw))))
         new_bytes = (json.dumps(new, indent=2, ensure_ascii=False) + "\n").encode()
         if new != old:
             out.append((CLAUDE_FILE, raw, new_bytes, json.dumps(old, indent=2, ensure_ascii=False),
@@ -149,7 +189,7 @@ def plan(mode):
         tomllib.loads(text)
         new = codex_with_ours(text) if mode == "install" else codex_without_ours(text)
         tomllib.loads(new)  # refuse to write a file Codex cannot read
-        if new != text:
+        if new.rstrip() != text.rstrip():  # blank lines at the end only: no change
             out.append((CODEX_FILE, raw, new.encode(), text, new))
     if AGY_FILE.exists() or (mode == "install" and AGY_FILE.parent.is_dir()):
         raw = AGY_FILE.read_bytes() if AGY_FILE.exists() else b""
@@ -158,6 +198,15 @@ def plan(mode):
         new_bytes = (json.dumps(new, indent=2, ensure_ascii=False) + "\n").encode()
         if new != old:
             out.append((AGY_FILE, raw, new_bytes, json.dumps(old, indent=2, ensure_ascii=False) if raw else "",
+                        new_bytes.decode()))
+    if AGY_SETTINGS.exists():
+        raw = AGY_SETTINGS.read_bytes()
+        old = json.loads(raw)
+        new = (statusline_with_ours(json.loads(raw), "agy") if mode == "install"
+               else statusline_without_ours(json.loads(raw)))
+        new_bytes = (json.dumps(new, indent=2, ensure_ascii=False) + "\n").encode()
+        if new != old:
+            out.append((AGY_SETTINGS, raw, new_bytes, json.dumps(old, indent=2, ensure_ascii=False),
                         new_bytes.decode()))
     return out
 
@@ -199,12 +248,14 @@ def cmd_install(apply):
         bdir, n = states.BACKUP_DIR / f"{stamp}-{n}", n + 1
     bdir.mkdir(parents=True)
     # Backups and the manifest come first, so a crash after one file is written can be restored.
-    manifest = {}
+    manifest, names = {}, set()
     for path, old, new, _, _ in changes:
-        (bdir / path.name).write_bytes(old)
+        name = path.name if path.name not in names else f"{path.parent.name}-{path.name}"  # two settings.json
+        names.add(name)
+        (bdir / name).write_bytes(old)
         if path.exists():
-            shutil.copymode(path, bdir / path.name)
-        manifest[str(path)] = {"backup": str(bdir / path.name), "sha_before": sha(old), "sha_written": sha(new),
+            shutil.copymode(path, bdir / name)
+        manifest[str(path)] = {"backup": str(bdir / name), "sha_before": sha(old), "sha_written": sha(new),
                                **({} if path.exists() else {"created": True})}
     (bdir / "manifest.json").write_text(json.dumps(manifest, indent=1))
     for path, old, new, _, _ in changes:

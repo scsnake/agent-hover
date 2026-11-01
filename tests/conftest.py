@@ -17,3 +17,13 @@ def quiet_keyboard(monkeypatch):
     """The daemon waits while the person types; tests must not depend on the real keyboard."""
     from agent_hover import daemon
     monkeypatch.setattr(daemon, "keyboard_idle_s", lambda: 1e9)
+
+
+@pytest.fixture(autouse=True)
+def no_real_agent_config(monkeypatch, tmp_path_factory):
+    """Install tests must never plan or write the real agy files (hooks.json, settings.json)."""
+    from agent_hover import config_edit, quota
+    away = tmp_path_factory.mktemp("no-real-config")
+    monkeypatch.setattr(config_edit, "AGY_FILE", away / "gemini-config" / "hooks.json")
+    monkeypatch.setattr(config_edit, "AGY_SETTINGS", away / "agy-settings.json")
+    monkeypatch.setattr(quota, "CORALLINE", away / "coralline")
