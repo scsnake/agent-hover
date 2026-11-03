@@ -30,6 +30,9 @@ class FakeSession:
     async def async_activate(self, select_tab=True, order_window_front=True):
         self.activated = True
 
+    async def async_close(self, force=False):
+        self.closed = force
+
 
 class FakeApp:
     def __init__(self, sid):
@@ -177,3 +180,34 @@ def test_hide_request(tmp_path, monkeypatch):
         (tmp_path / "requests" / f"{name}.json").write_text(json.dumps({"action": "hide", "session": sid}))
         asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}, hidden=hidden, focus=object(), apply=apply))
     assert len(buried) == 1 and hidden == {}
+
+
+def test_close_request_only_for_an_unchanged_tab(tmp_path, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(daemon, "REQUEST_DIR", tmp_path / "requests")
+    monkeypatch.setattr(daemon.states, "BURIED_FILE", tmp_path / "buried.json")
+    recs = {"S": {"state": "done", "ts": 100.0}}
+    monkeypatch.setattr(daemon.states, "read_state", lambda sid: recs.get(sid))
+    unburied = []
+
+    async def fake_unbury(app, sid, info, keep_selection=True):
+        unburied.append(sid)
+        return True
+
+    monkeypatch.setattr(daemon, "unbury", fake_unbury)
+    (tmp_path / "requests").mkdir()
+    ours = {"S": {"window": "w1", "index": 0}}
+
+    def close(sid, last, rec=None):
+        if rec:
+            recs["S"] = rec
+        app = FakeApp("S")
+        (tmp_path / "requests" / "a.json").write_text(json.dumps({"action": "close", "session": sid, "last": last}))
+        asyncio.run(daemon.handle_requests(app, ours, {}))
+        return getattr(app.session, "closed", None)
+
+    assert close("S", 100.0) is True and unburied == [] and ours == {}  # buried: closed where it is
+    assert close("S", 90.0) is None                          # a hook event came after the panel listed it
+    assert close("S", 100.0, {"state": "working", "ts": 100.0}) is None
+    assert close("S", None) is None and close("host:tmux-a-1", 100.0) is None  # no time; a remote row

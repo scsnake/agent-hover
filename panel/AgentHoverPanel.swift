@@ -856,11 +856,13 @@ final class HotKey {
 }
 
 /// The last line of the list: "▸ 5 stale (idle > 12 h, waiting > 24 h)". Hover (the cursor rests on it for
-/// hover_ms; Controller.checkFoldHover) shows those rows; a click shows or hides them.
+/// hover_ms; Controller.checkFoldHover) shows those rows; a click shows or hides them. On hover, a
+/// close icon at its end (also in the right-click menu) closes the local stale tabs, after a dialog.
 final class FoldView: NSView {
     let count: Int
     let open: Bool
     let onClick: () -> Void
+    var onClose: (() -> Void)?  // nil: no local stale tab to close
     private var hover = false
 
     init(count: Int, open: Bool, frame: NSRect, onClick: @escaping () -> Void) {
@@ -868,8 +870,8 @@ final class FoldView: NSView {
         self.open = open
         self.onClick = onClick
         super.init(frame: frame)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                       owner: self, userInfo: nil))
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways,
+                                                              .inVisibleRect], owner: self, userInfo: nil))
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -877,12 +879,51 @@ final class FoldView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseEntered(with event: NSEvent) { hover = true; needsDisplay = true }
     override func mouseExited(with event: NSEvent) { hover = false; needsDisplay = true }
-    override func mouseDown(with event: NSEvent) { onClick() }
+    override func mouseMoved(with event: NSEvent) { needsDisplay = true }
+
+    private var closeRect: NSRect? {
+        onClose == nil ? nil : NSRect(x: bounds.width - pad - fs(26), y: 0, width: fs(24), height: bounds.height)
+    }
+
+    /// As in RowView: read at draw time, since the views are rebuilt each second.
+    private var cursor: NSPoint? {
+        guard let w = window else { return nil }
+        let p = convert(w.mouseLocationOutsideOfEventStream, from: nil)
+        return bounds.contains(p) ? p : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if let r = closeRect, r.contains(convert(event.locationInWindow, from: nil)) { onClose?() } else { onClick() }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard onClose != nil else { return nil }
+        let m = NSMenu()
+        let item = NSMenuItem(title: "Close all stale tabs…", action: #selector(closeAll), keyEquivalent: "")
+        item.target = self
+        item.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: nil)
+        m.addItem(item)
+        return m
+    }
+
+    @objc func closeAll() { onClose?() }
 
     override func draw(_ dirtyRect: NSRect) {
-        if hover {
+        let c = cursor
+        if hover || c != nil {
             NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).setFill()
             NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
+            if let r = closeRect {
+                let on = c.map { r.contains($0) } ?? false
+                if on {
+                    NSColor.labelColor.withAlphaComponent(0.12).setFill()
+                    NSBezierPath(roundedRect: r.insetBy(dx: 1, dy: 2), xRadius: 4, yRadius: 4).fill()
+                }
+                if let img = rowIcon("xmark.circle", on ? .labelColor : .secondaryLabelColor) {
+                    img.draw(in: NSRect(x: r.midX - img.size.width / 2, y: (bounds.height - img.size.height) / 2,
+                                        width: img.size.width, height: img.size.height))
+                }
+            }
         }
         func h(_ v: Double) -> String { v == v.rounded() ? "\(Int(v)) h" : "\(v) h" }
         let why = [foldIdleH > 0 ? "idle > \(h(foldIdleH))" : nil, foldWaitingH > 0 ? "waiting > \(h(foldWaitingH))" : nil]
@@ -1916,6 +1957,10 @@ final class Controller: NSObject, NSSearchFieldDelegate {
                 self.foldHoverBlocked = !self.foldOpen  // closed by a click under the cursor
                 self.layout()
             }
+            let staleRows = stale.map { $0.0 }
+            if staleRows.contains(where: { $0.host == nil }) {
+                f.onClose = { [weak self] in self?.confirmCloseStale(staleRows) }
+            }
             listView.addSubview(f)
             foldView = f
             y += rowHeight
@@ -2008,6 +2053,36 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         return foldIdleH > 0 && ["done", "idle", "ended"].contains(r.state) && hours > foldIdleH
     }
 
+    /// The stale line's close icon: after a confirm dialog, ask the daemon to close the local stale
+    /// tabs. Remote rows stay (the remote scan only reads). The daemon closes a tab only if no hook
+    /// event came since this list ("last"): an agent that started work again stays.
+    func confirmCloseStale(_ rows: [Row]) {
+        let local = rows.filter { $0.host == nil }
+        guard !local.isEmpty else { return }
+        let n = local.count, plural = local.count > 1 ? "s" : ""
+        var lines = local.prefix(12).map { "• \($0.name) (\($0.state) \(shortAge($0.last ?? $0.since)))" }
+        if n > 12 { lines.append("and \(n - 12) more") }
+        var info = "The agents in these tabs stop. Claude Code and Codex sessions can be resumed later from the search.\n\n"
+            + lines.joined(separator: "\n")
+        let far = rows.count - n
+        if far > 0 { info += "\n\n\(far) remote row\(far > 1 ? "s are" : " is") not closed." }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Close \(n) stale tab\(plural)?"
+        alert.informativeText = info
+        let close = alert.addButton(withTitle: "Close \(n) Tab\(plural)")
+        let cancel = alert.addButton(withTitle: "Cancel")
+        close.hasDestructiveAction = true
+        close.keyEquivalent = ""
+        cancel.keyEquivalent = "\r"  // Return cancels: closing must be a click
+        alert.window.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        NSApp.activate(ignoringOtherApps: true)
+        let answer = alert.runModal()
+        NSApp.deactivate()  // the keyboard goes back to the app that had it
+        guard answer == .alertFirstButtonReturn else { return }
+        for r in local { sendRequest("close", r.session, extra: ["last": r.last ?? r.since]) }
+    }
+
     /// Pin or unpin; the daemon keeps the pins. The list sorts again, pinned rows first.
     func setPin(_ row: Row, _ on: Bool) {
         sendRequest(on ? "pin" : "unpin", row.session)
@@ -2041,7 +2116,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         }
     }
 
-    func sendRequest(_ action: String, _ session: String, extra: [String: String] = [:]) {
+    func sendRequest(_ action: String, _ session: String, extra: [String: Any] = [:]) {
         try? FileManager.default.createDirectory(at: requestDir, withIntermediateDirectories: true)
         let id = UUID().uuidString
         var obj: [String: Any] = extra

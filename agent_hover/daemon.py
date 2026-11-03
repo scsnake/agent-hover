@@ -426,6 +426,7 @@ async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hid
     stays buried until its state changes (it waits, or ends its turn) or the person raises it.
     Not in dry run: there nothing would raise it again.
     "resume" (a closed agent in the panel's search): see open_resume_tab.
+    "close" (the stale line's close icon, after the panel's confirm dialog): see close_tab.
     A remote row (session "host:tmux-..."): "peek" reads its tmux pane, "raise" see raise_remote."""
     buried_now = {x.session_id for x in app.buried_sessions}
     hidden = {} if hidden is None else hidden
@@ -474,6 +475,10 @@ async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hid
         if req.get("action") == "resume":
             await open_resume_tab(app, req)
             continue
+        if req.get("action") == "close" and sid and not far:
+            why = await close_tab(app, sid, req.get("last"), ours)
+            log("close", session=sid, ok=why is None, **({"why": why} if why else {}))
+            continue
         if req.get("action") != "raise" or not sid:
             continue
         hidden.pop(sid, None)
@@ -491,6 +496,25 @@ async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hid
         last_focus[sid] = time.time()
         log("raise_request", session=sid, found=True, was_buried=was_buried,
             lag_s=round(time.time() - req.get("ts", time.time()), 2))
+
+
+async def close_tab(app, sid, last, ours):
+    """Close a local tab that the person chose to close in the panel. Only if no hook event came
+    since the panel listed it (last = the time of its latest event then): an agent that started
+    work again in the meantime stays. force: the panel has asked already. None, or why not."""
+    rec = states.read_state(sid) or {}
+    if not isinstance(last, (int, float)) or not isinstance(rec.get("ts"), (int, float)):
+        return "unknown"
+    if rec.get("state") == states.WORKING or abs(rec["ts"] - last) > 0.5:
+        return "changed"
+    # A buried session closes where it is (tested on iTerm2 2026-11-03): no unbury, so it never shows.
+    session = next((x for x in app.buried_sessions if x.session_id == sid), None) or app.get_session_by_id(sid)
+    if session is None:
+        return "not found"
+    await session.async_close(force=True)
+    if ours.pop(sid, None) is not None:
+        save_buried(ours)
+    return None
 
 
 async def open_resume_tab(app, req):
