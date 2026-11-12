@@ -699,316 +699,358 @@ async def run(conn, args):
         h.start()
     log("start", apply=args.apply, n=cfg.n_active, idle_park_s=cfg.idle_park_s,
         working_park_s=cfg.working_park_s, remote=[h.name for h in hosts])
-    while not stop.is_set():
-        now = time.time()
-        t0 = time.monotonic()
-        parts = {}  # seconds per part of this tick, logged only when the tick is slow
-        await app.async_refresh()
-        await focus.refresh(app)
-        parts["refresh"] = time.monotonic() - t0
-        if now - seed_ts > SEED_SCAN_S:
-            t = time.monotonic()
-            await seed_agents(app, states.read_states(), seed_checked)
-            live = {s.session_id for w in app.terminal_windows for t in w.tabs for s in t.all_sessions}
-            live |= {s.session_id for s in app.buried_sessions}
-            if live:  # an empty list may be an iTerm2 hiccup: delete nothing then
-                for sid in states.prune_states(live):
-                    log("state_pruned", session=sid)
-            parts["seed"] = time.monotonic() - t
-            seed_ts = now
-        real = states.read_states()
-        if now - subs_ts > SUBAGENT_SCAN_S:
-            subs_ts = now
-            subs = await asyncio.to_thread(subagents.scan, {s: real[s] for s in listed if s in real}, now)
-        recs = subagents.overlay(real, subs)  # write state files only from real, not from recs
-        now_held = {sid for sid, r in recs.items() if r is not real[sid]}
-        for sid in now_held ^ held:
-            log("subagents_hold" if sid in now_held else "subagents_release", session=sid)
-        held = now_held
-        where, counts = layout(app)
-        buried_now = {s.session_id for s in app.buried_sessions}
-        ours = load_buried()
-
-        # The person unburied one of ours by hand: pin it until its state changes.
-        for sid in list(ours):
-            if sid not in buried_now:
-                ours.pop(sid)
-                if sid in recs:
-                    pinned[sid] = recs[sid].get("state")
-                hidden.pop(sid, None)
-                log("manual_unbury", session=sid)
-        save_buried(ours)
-        for sid in list(pinned):
-            if recs.get(sid, {}).get("state") != pinned[sid]:
-                pinned.pop(sid)
-        for sid in list(hidden):
-            state = real.get(sid, {}).get("state")
-            if state != hidden[sid]:
-                hidden.pop(sid)  # it waits, ends its turn, or starts work: show it by the rules
-                if state == states.IDLE:
-                    pinned[sid] = state  # a turn that ends in idle (seeded Claude, Codex abort): show it too
-                log("hide_end", session=sid, state=state)
-        pins = load_pins()
-        if any(sid not in where and sid not in buried_now and not remote.split_sid(sid) for sid in pins):
-            pins = {sid for sid in pins if sid in where or sid in buried_now or remote.split_sid(sid)}
-            save_pins(pins)  # a local tab closed
-
-        if pending_requests():
-            t = time.monotonic()
-            await handle_requests(app, ours, last_focus, hosts, remote_tabs, hidden, focus, args.apply)
-            parts["requests"] = time.monotonic() - t
+    try:
+        while not stop.is_set():
+            now = time.time()
+            t0 = time.monotonic()
+            parts = {}  # seconds per part of this tick, logged only when the tick is slow
             await app.async_refresh()
             await focus.refresh(app)
+            parts["refresh"] = time.monotonic() - t0
+            if now - seed_ts > SEED_SCAN_S:
+                t = time.monotonic()
+                await seed_agents(app, states.read_states(), seed_checked)
+                live = {s.session_id for w in app.terminal_windows for t in w.tabs for s in t.all_sessions}
+                live |= {s.session_id for s in app.buried_sessions}
+                if live:  # an empty list may be an iTerm2 hiccup: delete nothing then
+                    for sid in states.prune_states(live):
+                        log("state_pruned", session=sid)
+                parts["seed"] = time.monotonic() - t
+                seed_ts = now
+            real = states.read_states()
+            if now - subs_ts > SUBAGENT_SCAN_S:
+                subs_ts = now
+                subs = await asyncio.to_thread(subagents.scan, {s: real[s] for s in listed if s in real}, now)
+            recs = subagents.overlay(real, subs)  # write state files only from real, not from recs
+            now_held = {sid for sid, r in recs.items() if r is not real[sid]}
+            for sid in now_held ^ held:
+                log("subagents_hold" if sid in now_held else "subagents_release", session=sid)
+            held = now_held
             where, counts = layout(app)
-            buried_now = {x.session_id for x in app.buried_sessions}
-            pins = load_pins()  # a pin or unpin request changes it
+            buried_now = {s.session_id for s in app.buried_sessions}
+            ours = load_buried()
 
-        if focus.session and focus.app_active:
-            last_focus[focus.session] = now
-        tabs, release = [], []
-        for sid in ours:
-            if sid not in recs or recs[sid].get("state") == states.ENDED:
-                release.append(sid)  # agent gone or state unknown: give the tab back
-        for sid, r in recs.items():
-            if r.get("state") == states.ENDED or sid in release:
-                continue
-            selected = False
-            if sid in where:
-                win, tab, n_sessions, _ = where[sid]
-                if n_sessions > 1:
-                    continue  # split panes: not managed in POC 1
-                window, is_buried = win.window_id, False
-                selected = win.current_tab is not None and win.current_tab.tab_id == tab.tab_id
-            elif sid in ours:
-                window, is_buried = ours[sid]["window"], True
-            else:
-                continue  # closed, or buried by the person
-            # At start, treat old visible states as seen, so old "done" tabs can park later.
-            # A tab that was buried (for example during a crash) is not seen: it must come back.
-            if since.get(sid, (None,))[0] != r["state"]:
-                since[sid] = (r["state"], r["ts"])
-            old_visible = r["ts"] < started - 60 and sid not in ours
-            lf = last_focus.setdefault(sid, started if old_visible else 0.0)
-            tabs.append(Tab(session=sid, window=window, state=r["state"], state_ts=r["ts"],
-                            buried=is_buried, focused=focus.has(sid), last_focus_ts=lf,
-                            pinned=pinned.get(sid) == r["state"] or sid in pins, state_since=since[sid][1],
-                            selected=selected, hidden=sid in hidden))
+            # The person unburied one of ours by hand: pin it until its state changes.
+            for sid in list(ours):
+                if sid not in buried_now:
+                    ours.pop(sid)
+                    if sid in recs:
+                        pinned[sid] = recs[sid].get("state")
+                    hidden.pop(sid, None)
+                    log("manual_unbury", session=sid)
+            save_buried(ours)
+            for sid in list(pinned):
+                if recs.get(sid, {}).get("state") != pinned[sid]:
+                    pinned.pop(sid)
+            for sid in list(hidden):
+                state = real.get(sid, {}).get("state")
+                if state != hidden[sid]:
+                    hidden.pop(sid)  # it waits, ends its turn, or starts work: show it by the rules
+                    if state == states.IDLE:
+                        pinned[sid] = state  # a turn that ends in idle (seeded Claude, Codex abort): show it too
+                    log("hide_end", session=sid, state=state)
+            pins = load_pins()
+            if any(sid not in where and sid not in buried_now and not remote.split_sid(sid) for sid in pins):
+                pins = {sid for sid in pins if sid in where or sid in buried_now or remote.split_sid(sid)}
+                save_pins(pins)  # a local tab closed
 
-        # Panel snapshot: every live agent tab, visible or buried (also split tabs).
-        listed = [sid for sid, r in recs.items() if r.get("state") != states.ENDED
-                  and (sid in where or sid in buried_now)]
-        if now - names_ts > NAME_REFRESH_S or any(sid not in names for sid in listed):
-            t = time.monotonic()
-            for sid in listed:
-                session = app.get_session_by_id(sid)
-                if session is not None:
-                    names[sid] = clean_name(await session.async_get_variable("autoName"))
-            agy = {sid: recs[sid].get("agent_session") for sid in listed if recs[sid].get("agent") == "agy"}
-            if agy:  # agy's terminal title is fixed: use its conversation title, else the first prompt
-                titles = agents.agy_titles(agy.values())
-                for sid, conversation in agy.items():
-                    name = titles.get(conversation) or agents.agy_first_prompt(conversation)
-                    if name:
-                        names[sid] = name
-            names_ts = now
-            parts["names"] = time.monotonic() - t
-        if update_on and now - update_ts > UPDATE_EVERY_S:
-            found = await asyncio.to_thread(check_update)
-            # A failed check (no network after wake, for example) is tried again in an hour.
-            update_ts = now if found else now - UPDATE_EVERY_S + 3600
-            if found:
-                update = found
-                tmp = UPDATE_FILE.with_suffix(".tmp")
-                tmp.write_text(json.dumps(update))
-                tmp.replace(UPDATE_FILE)
-            log("update_check", ok=found is not None, available=bool(found and found["available"]))
-        if now - codex_ts > CODEX_SCAN_S:
-            codex_ts = now
-            for sid in listed:
-                rec = real.get(sid, recs[sid])
-                if rec.get("agent") != "codex" or rec.get("state") != states.WORKING or not rec.get("agent_session"):
+            if pending_requests():
+                t = time.monotonic()
+                await handle_requests(app, ours, last_focus, hosts, remote_tabs, hidden, focus, args.apply)
+                parts["requests"] = time.monotonic() - t
+                await app.async_refresh()
+                await focus.refresh(app)
+                where, counts = layout(app)
+                buried_now = {x.session_id for x in app.buried_sessions}
+                pins = load_pins()  # a pin or unpin request changes it
+
+            if focus.session and focus.app_active:
+                last_focus[focus.session] = now
+            tabs, release = [], []
+            for sid in ours:
+                if sid not in recs or recs[sid].get("state") == states.ENDED:
+                    release.append(sid)  # agent gone or state unknown: give the tab back
+            for sid, r in recs.items():
+                if r.get("state") == states.ENDED or sid in release:
                     continue
-                aid = rec["agent_session"]
-                if not codex_paths.get(aid):
-                    codex_paths[aid] = states.codex_rollout(aid)
-                new = codex_turn_update(rec, codex_paths[aid], now)
-                latest = states.read_state(sid) or {}
-                if new and latest.get("ts") == rec.get("ts"):  # no newer hook event meanwhile
-                    states.write_state(sid, new)
-                    recs[sid] = new
-                    log("codex_turn_end", session=sid, state=new["state"], detail=new["detail"],
-                        resets_at=new.get("resets_at"))
-            # The usage limit is over: tell the person once (the agent does not go on by itself).
-            for sid in listed:
-                rec = recs[sid]
-                resets = rec.get("resets_at")
-                if (notify_reset and rec.get("state") == states.WAITING and isinstance(resets, (int, float))
-                        and resets <= now and not rec.get("reset_notified")):
-                    latest = states.read_state(sid) or {}
-                    if latest.get("ts") == rec.get("ts"):
-                        recs[sid] = {**rec, "reset_notified": True}
-                        states.write_state(sid, recs[sid])
-                        notify("Agent can continue", f"{names.get(sid) or rec.get('cwd') or sid}: the usage limit is over")
-                        log("limit_reset_notify", session=sid)
-        if now - agy_ts > AGY_SCAN_S:
-            agy_ts = now
-            agy_rows = [sid for sid in listed if recs[sid].get("agent") == "agy" and recs[sid].get("agent_session")]
-            tree = await asyncio.to_thread(agents.agy_tree) if agy_rows else {}
-            for sid in agy_rows:
-                rec = recs[sid]
-                root, sub = agents.agy_root(rec["agent_session"], tree)
-                if sub and (states.read_state(sid) or {}).get("ts") == rec.get("ts"):
-                    rec = recs[sid] = {**rec, "agent_session": root}  # linked to a sub-agent before: fix
-                    states.write_state(sid, rec)
-                    log("agy_main", session=sid, agent_session=root)
-                by_us = rec.get("event") == "agy_waiting"
-                if not (rec.get("state") == states.WORKING or by_us):
-                    continue
-                if (not by_us and now - rec.get("ts", now) > AGY_IDLE_S and agents.agy_idle(root, tree)
-                        and (states.read_state(sid) or {}).get("ts") == rec.get("ts")):
-                    # No Stop seen (or a late PostToolUse after it), and agy says the turn is over.
-                    rec = recs[sid] = {**rec, "state": states.DONE, "detail": "", "event": "agy_idle", "ts": now}
-                    states.write_state(sid, rec)
-                    log("agy_idle", session=sid)
-                    continue
-                step, asker = None, root
-                for cid in agents.agy_running_family(root, tree):  # a sub-agent can ask too
-                    step = await asyncio.to_thread(agents.agy_waiting_step, cid)
-                    if step:
-                        asker = cid
-                        break
-                if (states.read_state(sid) or {}).get("ts") != rec.get("ts"):
-                    continue  # a hook wrote meanwhile
-                if step and not by_us:
-                    tool, call = step
-                    new = {**rec, "state": states.WAITING, "event": "agy_waiting", "ts": now,
-                           "detail": f"approve {tool}" + (" (sub-agent)" if asker != root else ""),
-                           "question": agents.agy_question(tool, call)[:1500]}
-                elif by_us and not step:  # answered, and no hook event yet
-                    new = {**rec, "state": states.WORKING, "detail": "", "event": "agy_resumed", "ts": now}
-                    new.pop("question", None)
+                selected = False
+                if sid in where:
+                    win, tab, n_sessions, _ = where[sid]
+                    if n_sessions > 1:
+                        continue  # split panes: not managed in POC 1
+                    window, is_buried = win.window_id, False
+                    selected = win.current_tab is not None and win.current_tab.tab_id == tab.tab_id
+                elif sid in ours:
+                    window, is_buried = ours[sid]["window"], True
                 else:
-                    continue
-                states.write_state(sid, new)
-                recs[sid] = new
-                log("agy_prompt", session=sid, state=new["state"], detail=new["detail"])
-        if now - usage_ts > USAGE_SCAN_S:
-            t = time.monotonic()
-            table = await asyncio.to_thread(process_table)
-            children = child_map(table)
-            for sid in listed:
-                session = app.get_session_by_id(sid)
-                pid = job_pids[sid] = as_pid(await session.async_get_variable("jobPid")) if session is not None else None
-                if pid:
-                    usage[sid] = tree_usage(table, pid, children)
-                    hot[sid] = hot_update(hot_since, sid, recs[sid]["state"], usage[sid][0], now,
-                                          args.cpu_hot_pct, args.cpu_hot_min)
-            usage_ts = now
-            parts["usage"] = time.monotonic() - t
-        if now - commands_ts > COMMANDS_SCAN_S:
-            commands_ts = now
-            # After the usage scan (it reads each tab's job). Codex runs its hooks in its
-            # app-server, not under the tab's codex: link tab job and session here.
-            found = {recs[sid]["agent_session"]: ("codex", job_pids[sid]) for sid in listed
-                     if recs[sid].get("agent") == "codex" and recs[sid].get("agent_session") and job_pids.get(sid)}
-            await asyncio.to_thread(commands.remember, {**found, **agents.running_claude()})
-        for sid in listed:
-            if now - models.get(sid, (0, None))[0] > MODEL_REFRESH_S:
-                path = search.transcript(recs[sid].get("agent", ""), recs[sid].get("agent_session"))
-                # agy names its model in each hook event (no transcript lookup here)
-                models[sid] = (now, search.transcript_model(path) if path else recs[sid].get("model"))
-        if now - quota_ts > QUOTA_SCAN_S:
-            quota_ts = now
-            # Limits are per account: Claude and Codex rows show the newest data any of their tabs
-            # has; agy limits depend on the model.
-            claude_q, codex_q = quota.claude_quota(), None
-            for sid in listed:
-                aid = recs[sid].get("agent_session")
-                if recs[sid].get("agent") == "codex" and aid:
+                    continue  # closed, or buried by the person
+                # At start, treat old visible states as seen, so old "done" tabs can park later.
+                # A tab that was buried (for example during a crash) is not seen: it must come back.
+                if since.get(sid, (None,))[0] != r["state"]:
+                    since[sid] = (r["state"], r["ts"])
+                old_visible = r["ts"] < started - 60 and sid not in ours
+                lf = last_focus.setdefault(sid, started if old_visible else 0.0)
+                tabs.append(Tab(session=sid, window=window, state=r["state"], state_ts=r["ts"],
+                                buried=is_buried, focused=focus.has(sid), last_focus_ts=lf,
+                                pinned=pinned.get(sid) == r["state"] or sid in pins, state_since=since[sid][1],
+                                selected=selected, hidden=sid in hidden))
+
+            # Panel snapshot: every live agent tab, visible or buried (also split tabs).
+            listed = [sid for sid, r in recs.items() if r.get("state") != states.ENDED
+                      and (sid in where or sid in buried_now)]
+            if now - names_ts > NAME_REFRESH_S or any(sid not in names for sid in listed):
+                t = time.monotonic()
+                for sid in listed:
+                    session = app.get_session_by_id(sid)
+                    if session is not None:
+                        names[sid] = clean_name(await session.async_get_variable("autoName"))
+                agy = {sid: recs[sid].get("agent_session") for sid in listed if recs[sid].get("agent") == "agy"}
+                if agy:  # agy's terminal title is fixed: use its conversation title, else the first prompt
+                    titles = agents.agy_titles(agy.values())
+                    for sid, conversation in agy.items():
+                        name = titles.get(conversation) or agents.agy_first_prompt(conversation)
+                        if name:
+                            names[sid] = name
+                names_ts = now
+                parts["names"] = time.monotonic() - t
+            if update_on and now - update_ts > UPDATE_EVERY_S:
+                found = await asyncio.to_thread(check_update)
+                # A failed check (no network after wake, for example) is tried again in an hour.
+                update_ts = now if found else now - UPDATE_EVERY_S + 3600
+                if found:
+                    update = found
+                    tmp = UPDATE_FILE.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(update))
+                    tmp.replace(UPDATE_FILE)
+                log("update_check", ok=found is not None, available=bool(found and found["available"]))
+            if now - codex_ts > CODEX_SCAN_S:
+                codex_ts = now
+                for sid in listed:
+                    rec = real.get(sid, recs[sid])
+                    if rec.get("agent") != "codex" or rec.get("state") != states.WORKING or not rec.get("agent_session"):
+                        continue
+                    aid = rec["agent_session"]
                     if not codex_paths.get(aid):
                         codex_paths[aid] = states.codex_rollout(aid)
-                    q = quota.codex_quota_file(codex_paths[aid]) if codex_paths[aid] else None
-                    if q and (codex_q is None or (q["ts"] or 0) > (codex_q["ts"] or 0)):
-                        codex_q = q
-            statuses = {}
+                    new = codex_turn_update(rec, codex_paths[aid], now)
+                    latest = states.read_state(sid) or {}
+                    if new and latest.get("ts") == rec.get("ts"):  # no newer hook event meanwhile
+                        states.write_state(sid, new)
+                        recs[sid] = new
+                        log("codex_turn_end", session=sid, state=new["state"], detail=new["detail"],
+                            resets_at=new.get("resets_at"))
+                # The usage limit is over: tell the person once (the agent does not go on by itself).
+                for sid in listed:
+                    rec = recs[sid]
+                    resets = rec.get("resets_at")
+                    if (notify_reset and rec.get("state") == states.WAITING and isinstance(resets, (int, float))
+                            and resets <= now and not rec.get("reset_notified")):
+                        latest = states.read_state(sid) or {}
+                        if latest.get("ts") == rec.get("ts"):
+                            recs[sid] = {**rec, "reset_notified": True}
+                            states.write_state(sid, recs[sid])
+                            notify("Agent can continue", f"{names.get(sid) or rec.get('cwd') or sid}: the usage limit is over")
+                            log("limit_reset_notify", session=sid)
+            if now - agy_ts > AGY_SCAN_S:
+                agy_ts = now
+                agy_rows = [sid for sid in listed if recs[sid].get("agent") == "agy" and recs[sid].get("agent_session")]
+                tree = await asyncio.to_thread(agents.agy_tree) if agy_rows else {}
+                for sid in agy_rows:
+                    rec = recs[sid]
+                    root, sub = agents.agy_root(rec["agent_session"], tree)
+                    if sub and (states.read_state(sid) or {}).get("ts") == rec.get("ts"):
+                        rec = recs[sid] = {**rec, "agent_session": root}  # linked to a sub-agent before: fix
+                        states.write_state(sid, rec)
+                        log("agy_main", session=sid, agent_session=root)
+                    by_us = rec.get("event") == "agy_waiting"
+                    if not (rec.get("state") == states.WORKING or by_us):
+                        continue
+                    if (not by_us and now - rec.get("ts", now) > AGY_IDLE_S and agents.agy_idle(root, tree)
+                            and (states.read_state(sid) or {}).get("ts") == rec.get("ts")):
+                        # No Stop seen (or a late PostToolUse after it), and agy says the turn is over.
+                        rec = recs[sid] = {**rec, "state": states.DONE, "detail": "", "event": "agy_idle", "ts": now}
+                        states.write_state(sid, rec)
+                        log("agy_idle", session=sid)
+                        continue
+                    step, asker = None, root
+                    for cid in agents.agy_running_family(root, tree):  # a sub-agent can ask too
+                        step = await asyncio.to_thread(agents.agy_waiting_step, cid)
+                        if step:
+                            asker = cid
+                            break
+                    if (states.read_state(sid) or {}).get("ts") != rec.get("ts"):
+                        continue  # a hook wrote meanwhile
+                    if step and not by_us:
+                        tool, call = step
+                        new = {**rec, "state": states.WAITING, "event": "agy_waiting", "ts": now,
+                               "detail": f"approve {tool}" + (" (sub-agent)" if asker != root else ""),
+                               "question": agents.agy_question(tool, call)[:1500]}
+                    elif by_us and not step:  # answered, and no hook event yet
+                        new = {**rec, "state": states.WORKING, "detail": "", "event": "agy_resumed", "ts": now}
+                        new.pop("question", None)
+                    else:
+                        continue
+                    states.write_state(sid, new)
+                    recs[sid] = new
+                    log("agy_prompt", session=sid, state=new["state"], detail=new["detail"])
+            if now - usage_ts > USAGE_SCAN_S:
+                t = time.monotonic()
+                table = await asyncio.to_thread(process_table)
+                children = child_map(table)
+                for sid in listed:
+                    session = app.get_session_by_id(sid)
+                    pid = job_pids[sid] = as_pid(await session.async_get_variable("jobPid")) if session is not None else None
+                    if pid:
+                        usage[sid] = tree_usage(table, pid, children)
+                        hot[sid] = hot_update(hot_since, sid, recs[sid]["state"], usage[sid][0], now,
+                                              args.cpu_hot_pct, args.cpu_hot_min)
+                usage_ts = now
+                parts["usage"] = time.monotonic() - t
+            if now - commands_ts > COMMANDS_SCAN_S:
+                commands_ts = now
+                # After the usage scan (it reads each tab's job). Codex runs its hooks in its
+                # app-server, not under the tab's codex: link tab job and session here.
+                found = {recs[sid]["agent_session"]: ("codex", job_pids[sid]) for sid in listed
+                         if recs[sid].get("agent") == "codex" and recs[sid].get("agent_session") and job_pids.get(sid)}
+                await asyncio.to_thread(commands.remember, {**found, **agents.running_claude()})
             for sid in listed:
-                agent, aid = recs[sid].get("agent"), recs[sid].get("agent_session")
-                if agent == "codex" and codex_paths.get(aid):
-                    statuses[sid] = quota.codex_status_file(codex_paths[aid])
-                elif agent in ("claude", "agy"):
-                    statuses[sid] = quota.session_status(agent, aid)
-            quota.prune_status(now)
-            quotas = {sid: claude_q if recs[sid].get("agent") == "claude" else codex_q
-                      if recs[sid].get("agent") == "codex" else quota.agy_quota(models.get(sid, (0, None))[1])
-                      if recs[sid].get("agent") == "agy" else None for sid in listed}
-        focus_tag = (await remote_tag(app.get_session_by_id(focus.session), remote_tabs)
-                     if hosts and focus.session and focus.app_active and app.get_session_by_id(focus.session) else "")
-        far_rows = remote_panel_rows(hosts, now, started, focus_tag, last_focus, pins, remote_done,
-                                     remote_notified, notify_reset)
-        write_panel([{"session": sid, "name": names.get(sid) or Path(recs[sid].get("cwd") or "?").name,
-                      "agent": recs[sid].get("agent", ""), "state": recs[sid]["state"],
-                      "cwd": recs[sid].get("cwd") or "",
-                      "detail": recs[sid].get("detail", ""),
-                      "question": recs[sid].get("question") if recs[sid]["state"] == states.WAITING else None,
-                      "resets_at": recs[sid].get("resets_at") if recs[sid]["state"] == states.WAITING else None,
-                      "since": since.get(sid, (None, recs[sid]["ts"]))[1],
-                      "last": recs[sid]["ts"],
-                      "buried": sid in buried_now, "focused": focus.has(sid),
-                      "pinned": sid in pins, "hidden": sid in hidden, "model": models.get(sid, (0, None))[1],
-                      "cpu": usage.get(sid, (None, None))[0], "mem_mb": usage.get(sid, (None, None))[1],
-                      "hot": hot.get(sid, False), "quota": quotas.get(sid), "status": statuses.get(sid),
-                      "subagents": subs.get(sid),
-                      "unseen": recs[sid]["state"] == states.DONE and not focus.has(sid)
-                                and last_focus.get(sid, 0) < recs[sid]["ts"]} for sid in listed] + far_rows,
-                    args.apply, update=bool(update_on and update.get("available")))
+                if now - models.get(sid, (0, None))[0] > MODEL_REFRESH_S:
+                    path = search.transcript(recs[sid].get("agent", ""), recs[sid].get("agent_session"))
+                    # agy names its model in each hook event (no transcript lookup here)
+                    models[sid] = (now, search.transcript_model(path) if path else recs[sid].get("model"))
+            if now - quota_ts > QUOTA_SCAN_S:
+                quota_ts = now
+                # Limits are per account: Claude and Codex rows show the newest data any of their tabs
+                # has; agy limits depend on the model.
+                claude_q, codex_q = quota.claude_quota(), None
+                for sid in listed:
+                    aid = recs[sid].get("agent_session")
+                    if recs[sid].get("agent") == "codex" and aid:
+                        if not codex_paths.get(aid):
+                            codex_paths[aid] = states.codex_rollout(aid)
+                        q = quota.codex_quota_file(codex_paths[aid]) if codex_paths[aid] else None
+                        if q and (codex_q is None or (q["ts"] or 0) > (codex_q["ts"] or 0)):
+                            codex_q = q
+                statuses = {}
+                for sid in listed:
+                    agent, aid = recs[sid].get("agent"), recs[sid].get("agent_session")
+                    if agent == "codex" and codex_paths.get(aid):
+                        statuses[sid] = quota.codex_status_file(codex_paths[aid])
+                    elif agent in ("claude", "agy"):
+                        statuses[sid] = quota.session_status(agent, aid)
+                quota.prune_status(now)
+                quotas = {sid: claude_q if recs[sid].get("agent") == "claude" else codex_q
+                          if recs[sid].get("agent") == "codex" else quota.agy_quota(models.get(sid, (0, None))[1])
+                          if recs[sid].get("agent") == "agy" else None for sid in listed}
+            focus_tag = (await remote_tag(app.get_session_by_id(focus.session), remote_tabs)
+                         if hosts and focus.session and focus.app_active and app.get_session_by_id(focus.session) else "")
+            far_rows = remote_panel_rows(hosts, now, started, focus_tag, last_focus, pins, remote_done,
+                                         remote_notified, notify_reset)
+            write_panel([{"session": sid, "name": names.get(sid) or Path(recs[sid].get("cwd") or "?").name,
+                          "agent": recs[sid].get("agent", ""), "state": recs[sid]["state"],
+                          "cwd": recs[sid].get("cwd") or "",
+                          "detail": recs[sid].get("detail", ""),
+                          "question": recs[sid].get("question") if recs[sid]["state"] == states.WAITING else None,
+                          "resets_at": recs[sid].get("resets_at") if recs[sid]["state"] == states.WAITING else None,
+                          "since": since.get(sid, (None, recs[sid]["ts"]))[1],
+                          "last": recs[sid]["ts"],
+                          "buried": sid in buried_now, "focused": focus.has(sid),
+                          "pinned": sid in pins, "hidden": sid in hidden, "model": models.get(sid, (0, None))[1],
+                          "cpu": usage.get(sid, (None, None))[0], "mem_mb": usage.get(sid, (None, None))[1],
+                          "hot": hot.get(sid, False), "quota": quotas.get(sid), "status": statuses.get(sid),
+                          "subagents": subs.get(sid),
+                          "unseen": recs[sid]["state"] == states.DONE and not focus.has(sid)
+                                    and last_focus.get(sid, 0) < recs[sid]["ts"]} for sid in listed] + far_rows,
+                        args.apply, update=bool(update_on and update.get("available")))
 
-        d = decide(tabs, now, cfg, focus.changed_ts, counts)
-        for sid in release:
-            d.unbury.append(sid)
-            d.reasons[sid] = "raise: agent ended or state unknown"
-        sig = (tuple(d.bury), tuple(d.unbury))
-        if (d.bury or d.unbury) and sig != last_sig:
-            log("decide", apply=args.apply, bury=d.bury, unbury=d.unbury, reasons=d.reasons,
-                lag_s={s: round(now - recs[s]["ts"], 2) for s in d.unbury if s in recs},
-                focused=focus.session, app_active=focus.app_active,
-                focus_changed_s_ago=round(now - focus.changed_ts, 1))
-        last_sig = sig
-        unbury_now = d.unbury
-        if args.apply and d.unbury and keyboard_idle_s() < TYPING_QUIET_S:
-            if not deferring:
-                log("defer_unbury", sessions=d.unbury, keyboard_idle_s=round(keyboard_idle_s(), 1))
-            deferring, unbury_now = True, []
-        else:
-            deferring = False
-        if args.apply and (unbury_now or d.bury):
-            t = time.monotonic()
-            for sid in unbury_now:
-                await unbury(app, sid, ours.get(sid, {}))
-                ours.pop(sid, None)
-                save_buried(ours)
-            for sid in d.bury:
-                await bury(app, sid, focus, ours, d.reasons.get(sid, ""))
-            parts["act"] = time.monotonic() - t
-        tick_s = time.monotonic() - t0
-        if tick_s > SLOW_TICK_S:
-            log("slow_tick", s=round(tick_s, 2), parts={k: round(v, 2) for k, v in parts.items()},
-                sessions=len(where), buried=len(buried_now))
-        for _ in range(int(TICK_S / 0.2)):  # wake early for a panel click
-            try:
-                await asyncio.wait_for(stop.wait(), 0.2)
-            except asyncio.TimeoutError:
-                pass
-            if stop.is_set() or pending_requests():
-                break
-
-    for h in hosts:
-        h.stop()
+            d = decide(tabs, now, cfg, focus.changed_ts, counts)
+            for sid in release:
+                d.unbury.append(sid)
+                d.reasons[sid] = "raise: agent ended or state unknown"
+            sig = (tuple(d.bury), tuple(d.unbury))
+            if (d.bury or d.unbury) and sig != last_sig:
+                log("decide", apply=args.apply, bury=d.bury, unbury=d.unbury, reasons=d.reasons,
+                    lag_s={s: round(now - recs[s]["ts"], 2) for s in d.unbury if s in recs},
+                    focused=focus.session, app_active=focus.app_active,
+                    focus_changed_s_ago=round(now - focus.changed_ts, 1))
+            last_sig = sig
+            unbury_now = d.unbury
+            if args.apply and d.unbury and keyboard_idle_s() < TYPING_QUIET_S:
+                if not deferring:
+                    log("defer_unbury", sessions=d.unbury, keyboard_idle_s=round(keyboard_idle_s(), 1))
+                deferring, unbury_now = True, []
+            else:
+                deferring = False
+            if args.apply and (unbury_now or d.bury):
+                t = time.monotonic()
+                for sid in unbury_now:
+                    await unbury(app, sid, ours.get(sid, {}))
+                    ours.pop(sid, None)
+                    save_buried(ours)
+                for sid in d.bury:
+                    await bury(app, sid, focus, ours, d.reasons.get(sid, ""))
+                parts["act"] = time.monotonic() - t
+            tick_s = time.monotonic() - t0
+            if tick_s > SLOW_TICK_S:
+                log("slow_tick", s=round(tick_s, 2), parts={k: round(v, 2) for k, v in parts.items()},
+                    sessions=len(where), buried=len(buried_now))
+            for _ in range(int(TICK_S / 0.2)):  # wake early for a panel click
+                try:
+                    await asyncio.wait_for(stop.wait(), 0.2)
+                except asyncio.TimeoutError:
+                    pass
+                if stop.is_set() or pending_requests():
+                    break
+    finally:  # also when run_watched cancels this task: iTerm2 went away
+        for h in hosts:
+            h.stop()
     if args.apply:
         await restore_all(app)
     log("stop")
 
 
-DAEMON_DEFAULTS = {"n": ("n_active", 5), "idle_min": ("idle_min", 20.0),
+LOST = "iterm2-lost"  # run_watched's result when the iTerm2 connection closed
+WATCH_S = 2.0
+
+
+def connection_closed(conn):
+    ws = conn.websocket
+    return ws is None or ws.closed
+
+
+async def run_watched(conn, args):
+    """Run run() and watch the websocket. When iTerm2 quits (or the connection drops), the
+    library's reader task dies and every pending API call waits forever: run() would hang with
+    a live pid. So cancel run() then, and return LOST: main() connects again."""
+    task = asyncio.ensure_future(run(conn, args))
+    while not task.done():
+        await asyncio.wait({task}, timeout=WATCH_S)
+        if not task.done() and connection_closed(conn):
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001 - the cancel, or an error from the dead link
+                pass
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):  # run() set them on this loop
+                loop.remove_signal_handler(sig)
+            return LOST
+    if not task.cancelled() and task.exception() is not None and connection_closed(conn):
+        log("iterm2_lost_error", error=repr(task.exception())[:200])
+        return LOST  # a call on the dead link raised instead of hanging
+    return task.result()
+
+
+def run_reconnecting(args):
+    """Connect to iTerm2 (retry: wait until it runs), run, and connect again when it goes away."""
+    while True:
+        if iterm2.run_until_complete(lambda conn: run_watched(conn, args), retry=True) != LOST:
+            return
+        log("iterm2_lost")
+        time.sleep(WATCH_S)
+
+
+DAEMON_DEFAULTS = {"n":("n_active", 5), "idle_min": ("idle_min", 20.0),
                    "working_park_s": ("working_park_s", 0.0),
                    "cpu_hot_pct": ("cpu_hot_pct", 50.0), "cpu_hot_min": ("cpu_hot_min", 2.0)}
 
@@ -1052,7 +1094,10 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         sys.exit("agent-hover daemon already running (lock held). Use ./run.sh stop first.")
-    iterm2.run_until_complete(lambda conn: run(conn, args))
+    if args.restore:
+        iterm2.run_until_complete(lambda conn: run(conn, args))
+    else:
+        run_reconnecting(args)
 
 
 if __name__ == "__main__":
