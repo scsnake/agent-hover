@@ -975,6 +975,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
     var foldView: FoldView?
     var foldHoverSince: Date?
     var foldHoverBlocked = false  // a click closed the fold: no hover-open until the cursor leaves it
+    var foldHoverOpened: Date?    // when a hover opened the fold: a click this soon after is ignored
     var blinking = Set<String>()  // sessions whose agent mark blinks: their usage limit is over
     var blinkDone = Set<String>()  // blinked once already (only the first open after the reset)
     var blinkUntil = Date.distantPast
@@ -1350,6 +1351,7 @@ final class Controller: NSObject, NSSearchFieldDelegate {
         if now.timeIntervalSince(foldHoverSince!) >= max(0.15, hoverMs / 1000) {
             foldHoverSince = nil
             foldOpen = true
+            foldHoverOpened = now
             layout()
         }
     }
@@ -1953,6 +1955,9 @@ final class Controller: NSObject, NSSearchFieldDelegate {
             let f = FoldView(count: stale.count, open: foldOpen, frame: NSRect(x: 0, y: y, width: width, height: rowHeight)) {
                 [weak self] in
                 guard let self = self else { return }
+                // The hover opened it just now: this click meant "open", not "close".
+                if self.foldOpen, let t = self.foldHoverOpened, Date().timeIntervalSince(t) < 0.5 { return }
+                self.foldHoverOpened = nil
                 self.foldOpen.toggle()
                 self.foldHoverBlocked = !self.foldOpen  // closed by a click under the cursor
                 self.layout()
