@@ -212,3 +212,18 @@ def test_cache_rebuilds_when_the_text_file_is_gone(tmp_path):
     text_file, _ = search._cache_files(f)
     text_file.unlink()
     assert search.search_chat(f, "invoice") == (1, "one invoice")
+
+
+def test_session_title(tmp_path, monkeypatch):
+    """The name for a tab that iTerm2 left as a placeholder ("Chat", after a crash restore)."""
+    monkeypatch.setattr(search, "CLAUDE_PROJECTS", tmp_path / "projects")
+    proj = tmp_path / "projects" / "-Users-x"
+    write_jsonl(proj / "A.jsonl", [msg("fix the invoice export"), {"type": "ai-title", "aiTitle": "Invoice export"}])
+    write_jsonl(proj / "B.jsonl", [msg("fix the invoice export"), {"type": "ai-title", "aiTitle": "Invoice export"},
+                                   {"type": "custom-title", "customTitle": "My \"invoices\""}])
+    write_jsonl(proj / "C.jsonl", [msg("only a prompt")])
+    assert search.session_title("claude", "A") == "Invoice export"
+    assert search.session_title("claude", "B") == 'My "invoices"'
+    assert search.session_title("claude", "C") == "only a prompt"
+    assert search.session_title("claude", "MISSING") == ""
+    assert search.session_title("claude", None) == ""

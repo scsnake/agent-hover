@@ -17,6 +17,12 @@ def clean_name(name):
     return re.sub(r"^[^\w(\[]+", "", name or "").strip()
 
 
+# Tab names that do not come from the agent. iTerm2 3.7's Claude Code trigger names a Claude
+# tab "Chat"; after an iTerm2 crash restore that name stays and the agent's own title is gone
+# until the agent sets it again (an idle agent does not).
+PLACEHOLDER_NAMES = {"", "Chat"}
+
+
 AGENTS = ["claude", "codex", "agy"]  # plus config.json "agents": {"extra": [...]}
 # Claude Code keeps one file per running process: {"pid", "sessionId", "cwd", "status", ...}.
 CLAUDE_SESSIONS = Path.home() / ".claude" / "sessions"

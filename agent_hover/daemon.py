@@ -679,6 +679,7 @@ async def run(conn, args):
     deferring = False  # automatic unburies wait while the person types
     since = {}  # session -> (state, time the daemon first saw that state)
     names, names_ts = {}, 0.0
+    tab_titles = {}  # session -> (time read, title from its transcript): for a placeholder tab name
     models = {}  # session -> (time read, model or None)
     commands_ts, job_pids = 0.0, {}  # iTerm2 session -> its foreground job (from the usage scan)
     usage, hot, hot_since, usage_ts = {}, {}, {}, 0.0  # session -> (cpu, MB) / bool / time hot began
@@ -804,6 +805,11 @@ async def run(conn, args):
                     session = app.get_session_by_id(sid)
                     if session is not None:
                         names[sid] = clean_name(await session.async_get_variable("autoName"))
+                    if names.get(sid) in agents.PLACEHOLDER_NAMES and recs[sid].get("agent_session"):
+                        if now - tab_titles.get(sid, (0, ""))[0] > MODEL_REFRESH_S:
+                            tab_titles[sid] = (now, await asyncio.to_thread(
+                                search.session_title, recs[sid].get("agent", ""), recs[sid]["agent_session"]))
+                        names[sid] = tab_titles[sid][1]  # "": the panel shows the folder name
                 agy = {sid: recs[sid].get("agent_session") for sid in listed if recs[sid].get("agent") == "agy"}
                 if agy:  # agy's terminal title is fixed: use its conversation title, else the first prompt
                     titles = agents.agy_titles(agy.values())

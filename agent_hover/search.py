@@ -77,6 +77,19 @@ def transcript(agent, agent_session):
     return found[-1] if found else None
 
 
+def session_title(agent, agent_session):
+    """The session's name from its transcript: the name you set, else Claude's AI title, else the
+    first prompt. "" if none (or no transcript)."""
+    path = transcript(agent, agent_session)
+    if not path:
+        return ""
+    try:
+        meta = _update_cache(path)[1].get("meta", {})
+    except OSError:
+        return ""
+    return meta.get("custom_title") or meta.get("ai_title") or meta.get("first_prompt") or ""
+
+
 MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]{1,80})"')
 PROVIDER_RE = re.compile(r'"model_provider"\s*:\s*"([^"]{1,80})"')
 
