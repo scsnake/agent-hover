@@ -87,10 +87,11 @@ def test_overlay_keeps_a_done_tab_working_only_in_memory():
     assert recs["a"]["state"] == states.DONE
 
 
-def test_scan_only_reads_claude_and_codex(tmp_path, monkeypatch):
+def test_scan_only_lists_sessions_with_subagents(tmp_path, monkeypatch):
     t = claude_session(tmp_path, ({"agentType": "a"}, 5))
     monkeypatch.setattr(subagents.search, "transcript", lambda agent, aid: t if aid == "c1" else None)
     monkeypatch.setattr(subagents, "CODEX_SESSIONS", tmp_path / "none")
+    monkeypatch.setattr(subagents.quota, "STATUS_DIR", tmp_path / "status")
     recs = {"s1": {"agent": "claude", "agent_session": "c1"}, "s2": {"agent": "agy", "agent_session": "g"},
             "s3": {"agent": "codex", "agent_session": "x"}, "s4": {"agent": "claude"}}
     assert list(subagents.scan(recs, time.time())) == ["s1"]
@@ -140,3 +141,90 @@ def test_codex_last_tool_and_message(tmp_path):
     assert subagents._codex_last(path) == ("apply_patch: {}", "Done here")
     path.write_text(json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "End"}}) + "\n")
     assert subagents._codex_last(path) == (None, "End")
+
+
+AGY_ID = "458b21a3-3f6f-4e0d-ad44-ccab8caef0c6"
+
+
+def agy_status(tmp_path, monkeypatch, subs, ts):
+    """A status file as quota_tee.py writes it for agy (the shape agy 1.5.16 sends)."""
+    folder = tmp_path / "status"
+    folder.mkdir(exist_ok=True)
+    (folder / f"agy-{AGY_ID}.json").write_text(json.dumps({"model": "Gemini 4 Hydrogen (High)", "ts": ts,
+                                                         "subagents": subs}))
+    monkeypatch.setattr(subagents.quota, "STATUS_DIR", folder)
+    monkeypatch.setattr(subagents.agents, "agy_tree", lambda: {})  # never the real agy database
+
+
+def agy_sub(role, status):
+    return {"name": "self", "role": role, "model": "Gemini 4 Hydrogen (High)", "status": status}
+
+
+def test_agy_running_and_completed(tmp_path, monkeypatch):
+    subagents._agy_seen.clear()
+    now = time.time()
+    agy_status(tmp_path, monkeypatch, [agy_sub("Prime Number Lister", "completed"),
+                                       agy_sub("Write tests", "running")], now)
+    info = subagents.agy(AGY_ID, now)
+    assert [(r["kind"], r["what"], r["model"]) for r in info["running"]] == [("self", "Write tests", "Gemini 4 Hydrogen (High)")]
+    assert [r["what"] for r in info["recent"]] == ["Prime Number Lister"] and info["done"] == 1
+    assert info["running"][0]["tool"] is None and info["running"][0]["message"] is None
+
+
+def test_agy_since_is_first_seen_and_ended_is_when_it_ended(tmp_path, monkeypatch):
+    subagents._agy_seen.clear()
+    t0 = time.time()
+    agy_status(tmp_path, monkeypatch, [agy_sub("Prime Number Lister", "running")], t0)
+    assert subagents.agy(AGY_ID, t0)["running"][0]["since"] == t0
+    # agy gives the role a longer text later: still the same subagent
+    agy_status(tmp_path, monkeypatch, [agy_sub("Write the first 60 prime numbers", "completed")], t0 + 30)
+    info = subagents.agy(AGY_ID, t0 + 30)
+    assert info["running"] == [] and info["recent"][0]["since"] == t0 and info["recent"][0]["ended"] == t0 + 30
+    assert subagents.agy(AGY_ID, t0 + 60)["recent"][0]["ended"] == t0 + 30
+
+
+def test_agy_ended_before_the_daemon_saw_it(tmp_path, monkeypatch):
+    subagents._agy_seen.clear()
+    now = time.time()
+    agy_status(tmp_path, monkeypatch, [agy_sub("x", "completed")], now - 100)
+    assert subagents.agy(AGY_ID, now)["recent"][0]["ended"] == now - 100
+
+
+def test_agy_old_status_is_not_running(tmp_path, monkeypatch):
+    subagents._agy_seen.clear()
+    now = time.time()
+    agy_status(tmp_path, monkeypatch, [agy_sub("x", "running")], now - subagents.STALE_S - 1)
+    info = subagents.agy(AGY_ID, now)
+    assert info["running"] == [] and info["done"] == 1
+
+
+def test_agy_none_without_subagents(tmp_path, monkeypatch):
+    agy_status(tmp_path, monkeypatch, [], time.time())
+    assert subagents.agy(AGY_ID, time.time()) is None
+    assert subagents.agy("458b21a3-0000-0000-0000-000000000000", time.time()) is None  # no status file
+    (tmp_path / "status" / f"agy-{AGY_ID}.json").write_text(json.dumps({"model": "m", "ts": time.time()}))
+    assert subagents.agy(AGY_ID, time.time()) is None  # an older agy: no "subagents" in the input
+
+
+def test_scan_reads_agy_and_forgets_closed_sessions(tmp_path, monkeypatch):
+    subagents._agy_seen.clear()
+    monkeypatch.setattr(subagents, "CODEX_SESSIONS", tmp_path / "none")
+    agy_status(tmp_path, monkeypatch, [agy_sub("x", "running")], time.time())
+    out = subagents.scan({"s1": {"agent": "agy", "agent_session": AGY_ID}}, time.time())
+    assert list(out) == ["s1"] and len(out["s1"]["running"]) == 1 and subagents._agy_seen
+    subagents.scan({}, time.time())
+    assert subagents._agy_seen == {}
+
+
+def test_agy_running_entry_needs_the_database_once_the_input_is_old(tmp_path, monkeypatch):
+    """agy can leave its last input at "running" after the subagent ended (seen with 1.5.16)."""
+    subagents._agy_seen.clear()
+    now = time.time()
+    idle, busy = "CASCADE_RUN_STATUS_IDLE", "CASCADE_RUN_STATUS_RUNNING"
+    agy_status(tmp_path, monkeypatch, [agy_sub("x", "running")], now - 60)
+    ended = {AGY_ID: ("", idle), "sub1": (AGY_ID, idle)}
+    assert subagents.agy(AGY_ID, now, ended)["running"] == []
+    assert len(subagents.agy(AGY_ID, now, {**ended, "sub1": (AGY_ID, busy)})["running"]) == 1
+    assert len(subagents.agy(AGY_ID, now, {})["running"]) == 1  # no database row: trust the input
+    agy_status(tmp_path, monkeypatch, [agy_sub("x", "running")], now - 5)
+    assert len(subagents.agy(AGY_ID, now, ended)["running"]) == 1  # just started: the database can lag

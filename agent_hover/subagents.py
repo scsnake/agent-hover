@@ -6,6 +6,11 @@ the files the agents write themselves; no request, no hook, no install.
   Codex:  each subagent thread has its own session file. Its first line names the root session,
           its last turn record says if the thread still runs. Only the session folders of today
           and yesterday are read, so "done" can be less than all for an older session.
+  agy:    the "subagents" list of its last status-line input (quota_tee.py writes it to
+          ~/.agent-hover/status/agy-<conversation>.json): role, model and status of each. No
+          last tool or message; "since" and "ended" are when the daemon first saw it so. agy
+          does not always send a new input when a subagent ends, so after AGY_FRESH_S a
+          "running" entry counts only while agy's summary database lists a running subagent.
 
 A subagent that crashed never says that it ended, so one with no write for STALE_S is not running.
 Each running subagent and the last RECENT that ended also get their model, last tool and last
@@ -15,7 +20,7 @@ import json
 import time
 from pathlib import Path
 
-from agent_hover import search, states
+from agent_hover import agents, quota, search, states
 
 STALE_S = 15 * 60
 HEAD_BYTES = 1 << 20    # a Codex session file's first line holds the agent's whole instructions
@@ -30,6 +35,9 @@ _metas = {}     # meta file -> (mtime, data)
 _headers = {}   # Codex session file -> (root session, kind, what), or None for a main thread
 _paths = {}     # Claude session -> transcript
 _lasts = {}     # log file -> (mtime, (last tool, last message))
+_agy_seen = {}  # (conversation, index, name) -> [first seen, first seen ended or None]
+AGY_FRESH_S = 15  # a newer status-line input is trusted alone (agy's database can lag at a start)
+AGY_ENDED = {"completed", "failed", "error", "cancelled", "canceled", "killed", "stopped", "done"}
 
 
 def _short(text, limit):
@@ -197,9 +205,43 @@ def codex(children, now):
     return _info(running, ended, _codex_last)
 
 
+def agy(conversation, now, tree=None):
+    """{running, recent, done} of an agy session from its last status-line input, or None. A
+    "running" entry in an input older than STALE_S counts as ended: agy may have quit. tree:
+    agents.agy_tree(), read when not given."""
+    status = quota.session_status("agy", conversation) or {}
+    subs, ts = status.get("subagents"), status.get("ts")
+    if not isinstance(subs, list) or not isinstance(ts, (int, float)):
+        return None
+    tree = agents.agy_tree() if tree is None else tree
+    db_says = len(agents.agy_running_family(conversation, tree)) > 1 if conversation in tree else True
+    trusted = now - ts <= AGY_FRESH_S or (db_says and now - ts <= STALE_S)
+    running, ended = [], []
+    for i, s in enumerate(subs):
+        if not isinstance(s, dict):
+            continue
+        seen = _agy_seen.setdefault((conversation, i, s.get("name")), [now, None])
+        over = str(s.get("status") or "").lower() in AGY_ENDED or not trusted
+        if not over:
+            seen[1] = None
+        elif seen[1] is None:
+            seen[1] = now if seen[0] < now else min(now, ts)  # ended before the daemon saw it
+        entry = {"kind": _short(s.get("name") or "agent", 40), "what": _short(s.get("role"), MAX_TEXT),
+                 "since": seen[0], "ended": seen[1] or ts, "model": s.get("model") or None,
+                 "tool": None, "message": None}
+        (ended if over else running).append(entry)
+    if not running and not ended:
+        return None
+    return {"running": running, "recent": sorted(ended, key=lambda r: r["ended"], reverse=True)[:RECENT],
+            "done": len(ended)}
+
+
 def scan(recs, now):
-    """iTerm session -> {running, recent, done}, for the Claude and Codex records given."""
-    out, children = {}, None
+    """iTerm session -> {running, recent, done}, for the Claude, Codex and agy records given."""
+    out, children, tree = {}, None, None
+    live = {rec.get("agent_session") for rec in recs.values() if rec.get("agent") == "agy"}
+    for key in [k for k in _agy_seen if k[0] not in live]:
+        del _agy_seen[key]  # the tab closed or left the panel
     for sid, rec in recs.items():
         agent, aid = rec.get("agent"), rec.get("agent_session")
         info = None
@@ -211,6 +253,9 @@ def scan(recs, now):
         elif aid and agent == "codex":
             children = codex_children(now) if children is None else children
             info = codex(children.get(aid, []), now)
+        elif aid and agent == "agy":
+            tree = agents.agy_tree() if tree is None else tree
+            info = agy(aid, now, tree)
         if info:
             out[sid] = info
     return out

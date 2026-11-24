@@ -85,6 +85,25 @@ def test_tee_saves_session_status(tmp_path, monkeypatch):
     assert bad.returncode == 0 and sorted(p.name for p in (tmp_path / "status").iterdir()) == [f"claude-{sid}.json"]
 
 
+def test_tee_saves_agy_subagents(tmp_path, monkeypatch):
+    sid = "458b21a3-3f6f-4e0d-ad44-ccab8caef0c6"
+    sub = {"name": "self", "role": "Prime Number Lister", "model": "Gemini 4 Hydrogen (High)", "status": "running"}
+    payload = {"session_id": sid, "conversation_id": sid, "agent_state": "idle",
+               "model": {"id": "Gemini 4 Hydrogen (High)", "display_name": "Gemini 4 Hydrogen (High)", "effort": "high"},
+               "subagents": [sub, {"name": "self", "role": "r" * 1000, "status": None}, "junk"]}
+    assert run_tee(tmp_path, "agy", payload).returncode == 0
+    monkeypatch.setattr(quota, "STATUS_DIR", tmp_path / "status")
+    subs = quota.session_status("agy", sid)["subagents"]
+    assert subs[0] == sub and len(subs) == 2
+    assert subs[1] == {"name": "self", "role": "r" * 300, "model": "", "status": ""}
+    assert run_tee(tmp_path, "agy", {**payload, "subagents": [sub] * 50}).returncode == 0
+    assert len(quota.session_status("agy", sid)["subagents"]) == 20
+    assert run_tee(tmp_path, "agy", {k: v for k, v in payload.items() if k != "subagents"}).returncode == 0
+    assert quota.session_status("agy", sid)["subagents"] is None
+    assert run_tee(tmp_path, "claude", {**payload, "session_id": "d80d1af4-96fd-42bc-9aca-bf1de4130e11"}).returncode == 0
+    assert "subagents" not in quota.session_status("claude", "d80d1af4-96fd-42bc-9aca-bf1de4130e11")
+
+
 def test_codex_status_from_session_tail():
     ctx = {"type": "turn_context", "payload": {"model": "gpt-5.6-sol", "effort": "high"}}
     tok = {"type": "event_msg", "payload": {"type": "token_count", "info": {

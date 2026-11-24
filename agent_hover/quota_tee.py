@@ -5,8 +5,8 @@ Claude Code and agy send their usage limits to the status-line command on stdin 
 "rate_limits" five_hour / seven_day; agy: "quota" per bucket). This is the only place they
 give them without a request, so `./install.sh` puts this wrapper in front of the status-line
 command. It writes ~/.agent-hover/quota/<agent>.json, and the session's model, effort and
-context use to ~/.agent-hover/status/<agent>-<session>.json, and prints only what the real
-command prints. Standard library only (it runs at every status-line update); it never fails the line.
+context use (agy: also its subagents) to ~/.agent-hover/status/<agent>-<session>.json, and
+prints only what the real command prints. Standard library only (it runs at every status-line update); it never fails the line.
 """
 import fcntl
 import json
@@ -85,8 +85,25 @@ def merged_claude(old, new, now):
     return {"windows": out, "ts": max((w.get("seen") or 0 for w in out.values()), default=now)} if out else None
 
 
-def session_status(data, now):
-    """(session ID, {model, effort, ctx (percent), tok_in, tok_out, ts}) or None."""
+MAX_SUBAGENTS = 20
+
+
+def agy_subagents(data):
+    """agy's "subagents" list ({name, role, model, status} each, newest last), cut short, or None."""
+    subs = data.get("subagents")
+    if not isinstance(subs, list):
+        return None
+    out = []
+    for s in subs[-MAX_SUBAGENTS:]:
+        if isinstance(s, dict):
+            out.append({k: str(s.get(k) or "")[:limit] for k, limit in
+                        (("name", 40), ("role", 300), ("model", 80), ("status", 20))})
+    return out
+
+
+def session_status(data, now, agent=""):
+    """(session ID, {model, effort, ctx (percent), tok_in, tok_out, ts}) or None. For agy also
+    "subagents" (agy_subagents)."""
     sid = data.get("session_id") or data.get("conversation_id")
     if not isinstance(sid, str) or not SESSION_RE.fullmatch(sid):
         return None
@@ -97,6 +114,8 @@ def session_status(data, now):
     status = {"model": str(model.get("display_name") or model.get("id") or "")[:80] or None,
               "effort": str(level)[:20] if level else None, "ctx": num(ctx.get("used_percentage")),
               "tok_in": num(ctx.get("total_input_tokens")), "tok_out": num(ctx.get("total_output_tokens")), "ts": now}
+    if agent == "agy":
+        status["subagents"] = agy_subagents(data)
     return sid, status
 
 
@@ -126,7 +145,7 @@ def save(agent, raw):
                     write(QUOTA_DIR / "claude.json", found)
         elif found:
             write(QUOTA_DIR / f"{agent}.json", found)
-        status = session_status(data, now)
+        status = session_status(data, now, agent)
         if status:
             write(STATUS_DIR / f"{agent}-{status[0]}.json", status[1])
     except (OSError, ValueError, TypeError, AttributeError):
