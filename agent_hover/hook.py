@@ -24,6 +24,8 @@ IT2_STATUS = {states.WORKING: "working", states.WAITING: "waiting",
 CODEX_SESSION_CWD_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
 # Codex 0.163.0 and later set the iTerm2 status themselves (OSC 21337), only outside tmux.
 CODEX_OWN_STATUS = (0, 163, 0)
+# Codex runs these in a spawned subagent; they go to the subagent store, not the tab state.
+CODEX_SUBAGENT_EVENTS = ("SubagentStart", "SubagentStop")
 CLI_VERSION_RE = re.compile(rb'"cli_version"\s*:\s*"(\d+)\.(\d+)\.(\d+)')
 
 
@@ -97,6 +99,17 @@ def main():
                 commands.remember_from_hook(agent, payload["session_id"], os.getppid())
         except Exception:  # noqa: BLE001 - never break the agent
             pass
+    event = payload.get("hook_event_name")
+    if agent == "codex" and (event in CODEX_SUBAGENT_EVENTS or (event == "UserPromptSubmit" and payload.get("agent_id"))):
+        try:
+            saved = states.note_codex_subagent(payload, time.time())
+        except (OSError, ValueError):
+            saved = False  # a later turn still updates the tab state below
+        if event in CODEX_SUBAGENT_EVENTS:
+            states.append_log("events.jsonl", {"ts": time.time(), "agent": agent, "event": event,
+                                               "session": payload.get("session_id"),
+                                               "subagent": payload.get("agent_id"), "saved": saved})
+            return
     if agent == "agy":
         payload = states.agy_payload(sys.argv[2] if len(sys.argv) > 2 else "", payload)
     if agent == "codex" and from_app_server():

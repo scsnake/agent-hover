@@ -945,6 +945,7 @@ async def run(conn, args):
                     elif agent in ("claude", "agy"):
                         statuses[sid] = quota.session_status(agent, aid)
                 quota.prune_status(now)
+                states.prune_codex_subagents(now)
                 quotas = {sid: claude_q if recs[sid].get("agent") == "claude" else codex_q
                           if recs[sid].get("agent") == "codex" else quota.agy_quota(models.get(sid, (0, None))[1])
                           if recs[sid].get("agent") == "agy" else None for sid in listed}

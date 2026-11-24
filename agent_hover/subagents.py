@@ -1,11 +1,12 @@
 """Subagents of an agent session, for the panel: which run now, and what they do. Read only from
-the files the agents write themselves; no request, no hook, no install.
+the files the agents write themselves (Codex: what its subagent hooks saved); no request.
 
   Claude: <transcript without .jsonl>/subagents/agent-<id>.meta.json (type and description; it
           gets "finished": true at the end) and the agent-<id>.jsonl beside it.
-  Codex:  each subagent thread has its own session file. Its first line names the root session,
-          its last turn record says if the thread still runs. Only the session folders of today
-          and yesterday are read, so "done" can be less than all for an older session.
+  Codex:  the SubagentStart and SubagentStop hooks (hook.py) list each spawned subagent of a
+          session in ~/.agent-hover/subagents/codex-<session>.json, with its own session file.
+          That file's first line has its role and task, its last turn record says if it runs.
+          Internal subagents (for example a review thread) have no hooks and are not shown.
   agy:    the "subagents" list of its last status-line input (quota_tee.py writes it to
           ~/.agent-hover/status/agy-<conversation>.json): role, model and status of each. No
           last tool or message; "since" and "ended" are when the daemon first saw it so. agy
@@ -17,7 +18,6 @@ Each running subagent and the last RECENT that ended also get their model, last 
 message (for the panel's subagent frame), from the end of their log.
 """
 import json
-import time
 from pathlib import Path
 
 from agent_hover import agents, quota, search, states
@@ -29,7 +29,6 @@ MAX_TEXT = 80
 MAX_TOOL = 160
 MAX_MESSAGE = 600
 RECENT = 3
-CODEX_SESSIONS = search.CODEX_SESSIONS
 
 _metas = {}     # meta file -> (mtime, data)
 _headers = {}   # Codex session file -> (root session, kind, what), or None for a main thread
@@ -177,28 +176,21 @@ def _codex_header(path):
     return found
 
 
-def codex_children(now):
-    """Root Codex session -> [(session file, kind, what)] of recent subagent threads."""
-    out = {}
-    for days in (0, 1):
-        folder = CODEX_SESSIONS / time.strftime("%Y/%m/%d", time.localtime(now - days * 86400))
-        for path in folder.glob("rollout-*.jsonl"):
-            head = _codex_header(path)
-            if head:
-                out.setdefault(head[0], []).append((path, head[1], head[2]))
-    return out
-
-
-def codex(children, now):
-    """{running, recent, done} of a Codex session from its subagent threads, or None."""
+def codex(session, now):
+    """{running, recent, done} of a Codex session from its subagent hooks, or None. A subagent
+    runs while it has no SubagentStop after its last write and its last turn record is open:
+    a later turn (send_input) writes again, a crash stops writing."""
     running, ended = [], []
-    for path, kind, what in children:
+    for entry in states.load_codex_subagents(session).values():
+        path = entry.get("file") if isinstance(entry, dict) else None
         try:
-            st = path.stat()
-        except OSError:
-            continue
-        turn = None
-        if now - st.st_mtime < STALE_S:
+            st = Path(path).stat()
+        except (OSError, TypeError):
+            continue  # no session file yet, or it was moved
+        head = _codex_header(path)  # (root, role or nickname, task from agent_path)
+        kind, what = (head[1], head[2]) if head else (entry.get("type") or "agent", "")
+        stop, turn = entry.get("stop"), None
+        if now - st.st_mtime < STALE_S and not (isinstance(stop, (int, float)) and st.st_mtime <= stop + 1):
             turn = states.codex_last_turn(path, TAIL_BYTES, main_only=False)
             turn = turn or {"type": "task_started"}  # a long turn: its start is before the tail
         (running if turn and turn.get("type") == "task_started" else ended).append((kind, what, st, path))
@@ -238,7 +230,7 @@ def agy(conversation, now, tree=None):
 
 def scan(recs, now):
     """iTerm session -> {running, recent, done}, for the Claude, Codex and agy records given."""
-    out, children, tree = {}, None, None
+    out, tree = {}, None
     live = {rec.get("agent_session") for rec in recs.values() if rec.get("agent") == "agy"}
     for key in [k for k in _agy_seen if k[0] not in live]:
         del _agy_seen[key]  # the tab closed or left the panel
@@ -251,8 +243,7 @@ def scan(recs, now):
                 _paths[aid] = path
                 info = claude(path, now)
         elif aid and agent == "codex":
-            children = codex_children(now) if children is None else children
-            info = codex(children.get(aid, []), now)
+            info = codex(aid, now)
         elif aid and agent == "agy":
             tree = agents.agy_tree() if tree is None else tree
             info = agy(aid, now, tree)

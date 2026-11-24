@@ -43,6 +43,8 @@ def test_codex_block_is_valid_toml_and_removable():
     data = tomllib.loads(new)
     assert len(data["hooks"]["Stop"]) == 2
     assert data["hooks"]["Interrupt"][0]["hooks"][0]["timeout"] == 2
+    assert "agent_hover/hook.py" in data["hooks"]["SubagentStart"][0]["hooks"][0]["command"]
+    assert "agent_hover/hook.py" in data["hooks"]["SubagentStop"][0]["hooks"][0]["command"]
     assert ce.codex_with_ours(new) == new
     assert tomllib.loads(ce.codex_without_ours(new)) == tomllib.loads(CODEX)
 

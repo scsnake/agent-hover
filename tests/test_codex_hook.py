@@ -97,3 +97,63 @@ def test_codex_in_tmux_gets_the_status_from_the_hook(monkeypatch, tmp_path):
 
 def test_codex_version_is_none_without_a_file():
     assert hook.codex_version(None) is None
+
+
+CHILD = "019a0000-0000-7000-8000-00000000c41d"
+
+
+def subagent_event(event, **extra):
+    """A SubagentStart / SubagentStop input as Codex 0.172 sends it (hooks/src/schema.rs): it runs
+    in the subagent, session_id is the root session and agent_id the subagent's own thread."""
+    base = {"hook_event_name": event, "session_id": SID, "turn_id": "t1", "cwd": "/repo", "model": "gpt-5.6-terra",
+            "permission_mode": "default", "agent_id": CHILD, "agent_type": "default"}
+    if event == "SubagentStart":
+        base["transcript_path"] = "/sessions/rollout-child.jsonl"
+    else:
+        base.update(transcript_path="/sessions/rollout-root.jsonl", agent_transcript_path="/sessions/rollout-child.jsonl",
+                    stop_hook_active=False, last_assistant_message="hi")
+    return {**base, **extra}
+
+
+def run_hook(monkeypatch, payload):
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
+    hook.main()
+
+
+def test_subagent_hooks_fill_the_store_and_leave_the_tab_state(monkeypatch, tmp_path):
+    calls, t = setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(states, "SUBAGENT_DIR", tmp_path / "subagents")
+    send(monkeypatch, t, "Stop", "/repo")
+    run_hook(monkeypatch, subagent_event("SubagentStart"))
+    entry = states.load_codex_subagents(SID)[CHILD]
+    assert (entry["type"], entry["stop"], entry["file"]) == ("default", None, "/sessions/rollout-child.jsonl")
+    assert states.read_state(UUID)["state"] == "done"  # the main turn ended; overlay holds it while it runs
+    run_hook(monkeypatch, subagent_event("SubagentStop"))
+    entry = states.load_codex_subagents(SID)[CHILD]
+    assert entry["stop"] >= entry["start"] and entry["file"] == "/sessions/rollout-child.jsonl"
+    assert entry["message"] == "hi" and states.read_state(UUID)["event"] == "Stop"
+    # The parent sends it more work: its turn starts with a UserPromptSubmit that names it.
+    send(monkeypatch, t, "UserPromptSubmit", "/repo", agent_id=CHILD, agent_type="default")
+    assert states.load_codex_subagents(SID)[CHILD]["stop"] is None
+
+
+def test_subagent_hook_with_bad_ids_saves_nothing(monkeypatch, tmp_path):
+    setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(states, "SUBAGENT_DIR", tmp_path / "subagents")
+    run_hook(monkeypatch, subagent_event("SubagentStart", session_id="../../x"))
+    run_hook(monkeypatch, subagent_event("SubagentStart", agent_id=None))
+    assert not (tmp_path / "subagents").exists() or not list((tmp_path / "subagents").glob("codex-*"))
+
+
+def test_store_keeps_the_newest_and_prunes_old_files(monkeypatch, tmp_path):
+    import os
+    import time
+    monkeypatch.setattr(states, "SUBAGENT_DIR", tmp_path / "subagents")
+    monkeypatch.setattr(states, "SUBAGENT_MAX", 3)
+    for i in range(5):
+        states.note_codex_subagent(subagent_event("SubagentStart", agent_id=f"019a0000-child-{i:04d}"), time.time())
+    assert list(states.load_codex_subagents(SID)) == [f"019a0000-child-{i:04d}" for i in (2, 3, 4)]
+    path = states.codex_subagent_file(SID)
+    os.utime(path, (time.time() - states.SUBAGENT_KEEP_S - 1,) * 2)
+    states.prune_codex_subagents(time.time())
+    assert not path.exists()

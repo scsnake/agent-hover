@@ -454,3 +454,67 @@ def append_log(name, record):
         pass
     with open(path, "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+# ---- Codex subagents (SubagentStart / SubagentStop hooks) ---------------------------------
+
+SUBAGENT_DIR = HOME / "subagents"  # codex-<root session>.json: agent ID -> its start and stop
+SUBAGENT_KEEP_S = 7 * 86400
+SUBAGENT_MAX = 200  # per session; the oldest go first
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{7,63}")
+
+
+def codex_subagent_file(session):
+    return SUBAGENT_DIR / f"codex-{session}.json" if session and ID_RE.fullmatch(str(session)) else None
+
+
+def load_codex_subagents(session):
+    """agent ID -> {type, start, stop, file, message} of a Codex session, {} if none."""
+    path = codex_subagent_file(session)
+    try:
+        data = json.loads(path.read_text()) if path else {}
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def note_codex_subagent(payload, now):
+    """Save a SubagentStart or SubagentStop of Codex, or a later turn of a subagent (a
+    UserPromptSubmit with agent_id). These hooks run in the subagent: session_id is the root
+    session, agent_id the subagent's own thread. Returns True if it was saved."""
+    import fcntl
+    event, agent_id = payload.get("hook_event_name"), payload.get("agent_id")
+    path = codex_subagent_file(payload.get("session_id"))
+    if not path or not isinstance(agent_id, str) or not ID_RE.fullmatch(agent_id):
+        return False
+    ensure_dir(SUBAGENT_DIR)
+    with open(SUBAGENT_DIR / ".lock", "a") as lock:  # parallel subagents end at the same time
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = load_codex_subagents(payload["session_id"])
+        entry = data.pop(agent_id, None) or {"start": now}  # popped: the newest is last
+        entry["type"] = str(payload.get("agent_type") or entry.get("type") or "")[:40]
+        if event == "SubagentStop":
+            entry["stop"] = now
+            entry["file"] = payload.get("agent_transcript_path") or entry.get("file")
+            message = payload.get("last_assistant_message")
+            entry["message"] = message[:2000] if isinstance(message, str) else None
+        else:  # SubagentStart (its transcript_path is the subagent's file) or a new turn
+            entry["stop"] = None
+            if event == "SubagentStart":
+                entry["file"] = payload.get("transcript_path") or entry.get("file")
+        data[agent_id] = entry
+        data = dict(list(data.items())[-SUBAGENT_MAX:])
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, path)
+    return True
+
+
+def prune_codex_subagents(now):
+    """Delete the subagent files of sessions with no subagent event for SUBAGENT_KEEP_S."""
+    for p in SUBAGENT_DIR.glob("codex-*.json") if SUBAGENT_DIR.is_dir() else []:
+        try:
+            if now - p.stat().st_mtime > SUBAGENT_KEEP_S:
+                p.unlink(missing_ok=True)
+        except OSError:
+            continue

@@ -44,7 +44,7 @@ QUOTA_TAG = "agent_hover/quota_tee.py"
 CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
                  "PostToolUse", "Notification", "Stop", "StopFailure"]
 CODEX_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
-                "PostToolUse", "Stop", "Interrupt"]
+                "PostToolUse", "Stop", "Interrupt", "SubagentStart", "SubagentStop"]
 CODEX_SHORT_TIMEOUT = {"SessionEnd", "Interrupt"}  # Codex allows max 3 s for these
 BEGIN = "# >>> agent-hover (POC 1) hooks >>>"
 END = "# <<< agent-hover (POC 1) hooks <<<"

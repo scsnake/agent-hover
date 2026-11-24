@@ -55,24 +55,56 @@ def spawned(cid, root="root-1"):
         "agent_role": None}}}}
 
 
-def test_codex_children_by_root(tmp_path, monkeypatch):
+ROOT = "019a0000-0000-7000-8000-00000000aaaa"
+
+
+def codex_store(tmp_path, monkeypatch, **entries):
+    """The subagent store as hook.py writes it: agent ID -> {type, start, stop, file, message}."""
+    folder = tmp_path / "store"
+    folder.mkdir(exist_ok=True)
+    monkeypatch.setattr(states, "SUBAGENT_DIR", folder)
+    (folder / f"codex-{ROOT}.json").write_text(json.dumps(entries))
+
+
+def test_codex_subagents_from_the_hook_store(tmp_path, monkeypatch):
     now = time.time()
-    monkeypatch.setattr(subagents, "CODEX_SESSIONS", tmp_path)
-    today = tmp_path / time.strftime("%Y/%m/%d", time.localtime(now))
-    today.mkdir(parents=True)
-    codex_file(today, "main", {"id": "root-1", "source": "cli"}, "task_started")
-    codex_file(today, "a", spawned("a"), "task_started")
-    codex_file(today, "b", spawned("b"), "task_started", "task_complete")
-    codex_file(today, "c", spawned("c"), "task_started", age=subagents.STALE_S + 60)  # crashed
-    codex_file(today, "d", spawned("d"))  # first turn record not in the tail yet
-    codex_file(today, "e", {"id": "e", "session_id": "root-2", "parent_thread_id": "root-2",
-                            "source": {"subagent": "review"}}, "task_started")
-    children = subagents.codex_children(now)
-    assert sorted(children) == ["root-1", "root-2"]
-    info = subagents.codex(children["root-1"], now)
+    a = codex_file(tmp_path, "a", spawned("a", ROOT), "task_started")
+    b = codex_file(tmp_path, "b", spawned("b", ROOT), "task_started", "task_complete")
+    c = codex_file(tmp_path, "c", spawned("c", ROOT), "task_started", age=subagents.STALE_S + 60)  # crashed
+    d = codex_file(tmp_path, "d", spawned("d", ROOT))  # first turn record not in the tail yet
+    e = codex_file(tmp_path, "e", spawned("e", ROOT), "task_started", age=30)  # stopped, no write since
+    codex_store(tmp_path, monkeypatch,
+                a={"type": "default", "start": now - 9, "stop": None, "file": str(a)},
+                b={"type": "default", "start": now - 9, "stop": now - 5, "file": str(b)},
+                c={"type": "default", "start": now - 9999, "stop": None, "file": str(c)},
+                d={"type": "worker", "start": now - 9, "stop": None, "file": str(d)},
+                e={"type": "default", "start": now - 60, "stop": now - 20, "file": str(e)},
+                f={"type": "default", "start": now - 9, "stop": None, "file": str(tmp_path / "gone.jsonl")})
+    info = subagents.codex(ROOT, now)
     assert [(r["kind"], r["what"]) for r in info["running"]] == [("Parfit", "fix the tests")] * 2
-    assert info["done"] == 2
-    assert subagents.codex(children["root-2"], now)["running"][0]["kind"] == "review"
+    assert info["done"] == 3  # b ended, c crashed, e stopped; f has no file
+
+
+def test_codex_a_later_turn_runs_again(tmp_path, monkeypatch):
+    """A SubagentStop, then the parent sends the subagent more work: it writes after the stop."""
+    now = time.time()
+    a = codex_file(tmp_path, "a", spawned("a", ROOT), "task_started", "task_complete", "task_started", age=2)
+    codex_store(tmp_path, monkeypatch, a={"type": "default", "start": now - 60, "stop": now - 30, "file": str(a)})
+    assert len(subagents.codex(ROOT, now)["running"]) == 1
+
+
+def test_codex_kind_from_the_hook_without_a_header(tmp_path, monkeypatch):
+    now = time.time()
+    a = tmp_path / "a.jsonl"
+    a.write_text(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+    codex_store(tmp_path, monkeypatch, a={"type": "explorer", "start": now, "stop": None, "file": str(a)})
+    assert [(r["kind"], r["what"]) for r in subagents.codex(ROOT, now)["running"]] == [("explorer", "")]
+
+
+def test_codex_no_store_no_subagents(tmp_path, monkeypatch):
+    monkeypatch.setattr(states, "SUBAGENT_DIR", tmp_path / "none")
+    assert subagents.codex(ROOT, time.time()) is None
+    assert subagents.codex("../../etc/passwd", time.time()) is None
 
 
 def test_overlay_keeps_a_done_tab_working_only_in_memory():
@@ -90,7 +122,7 @@ def test_overlay_keeps_a_done_tab_working_only_in_memory():
 def test_scan_only_lists_sessions_with_subagents(tmp_path, monkeypatch):
     t = claude_session(tmp_path, ({"agentType": "a"}, 5))
     monkeypatch.setattr(subagents.search, "transcript", lambda agent, aid: t if aid == "c1" else None)
-    monkeypatch.setattr(subagents, "CODEX_SESSIONS", tmp_path / "none")
+    monkeypatch.setattr(states, "SUBAGENT_DIR", tmp_path / "none")
     monkeypatch.setattr(subagents.quota, "STATUS_DIR", tmp_path / "status")
     recs = {"s1": {"agent": "claude", "agent_session": "c1"}, "s2": {"agent": "agy", "agent_session": "g"},
             "s3": {"agent": "codex", "agent_session": "x"}, "s4": {"agent": "claude"}}
@@ -208,7 +240,7 @@ def test_agy_none_without_subagents(tmp_path, monkeypatch):
 
 def test_scan_reads_agy_and_forgets_closed_sessions(tmp_path, monkeypatch):
     subagents._agy_seen.clear()
-    monkeypatch.setattr(subagents, "CODEX_SESSIONS", tmp_path / "none")
+    monkeypatch.setattr(states, "SUBAGENT_DIR", tmp_path / "none")
     agy_status(tmp_path, monkeypatch, [agy_sub("x", "running")], time.time())
     out = subagents.scan({"s1": {"agent": "agy", "agent_session": AGY_ID}}, time.time())
     assert list(out) == ["s1"] and len(out["s1"]["running"]) == 1 and subagents._agy_seen
