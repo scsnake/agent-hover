@@ -108,7 +108,9 @@ def main():
         if event in CODEX_SUBAGENT_EVENTS:
             states.append_log("events.jsonl", {"ts": time.time(), "agent": agent, "event": event,
                                                "session": payload.get("session_id"),
-                                               "subagent": payload.get("agent_id"), "saved": saved})
+                                               "subagent": payload.get("agent_id"), "saved": saved,
+                                               "file": payload.get("agent_transcript_path" if event == "SubagentStop"
+                                                                   else "transcript_path")})
             return
     if agent == "agy":
         payload = states.agy_payload(sys.argv[2] if len(sys.argv) > 2 else "", payload)

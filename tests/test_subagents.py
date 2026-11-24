@@ -93,6 +93,22 @@ def test_codex_a_later_turn_runs_again(tmp_path, monkeypatch):
     assert len(subagents.codex(ROOT, now)["running"]) == 1
 
 
+def test_codex_file_found_by_name_when_the_hook_gave_none(tmp_path, monkeypatch):
+    """Seen with Codex 0.172: the subagent ran, but its store entry had no file until SubagentStop."""
+    now = time.time()
+    child = "01a20dd0-db82-7f70-99b3-44dd38d5c31b"
+    day = tmp_path / time.strftime("%Y/%m/%d", time.localtime(now))
+    day.mkdir(parents=True)
+    codex_file(day, f"2026-11-24T21-48-41-{child}", spawned(child, ROOT), "task_started")
+    monkeypatch.setattr(subagents, "CODEX_SESSIONS", tmp_path)
+    subagents._codex_files.clear()
+    codex_store(tmp_path, monkeypatch, **{child: {"type": "default", "start": now - 5, "stop": None, "file": None}})
+    assert [r["kind"] for r in subagents.codex(ROOT, now)["running"]] == ["Parfit"]
+    subagents._codex_files.clear()
+    codex_store(tmp_path, monkeypatch, **{"019a0000-0000-7000-8000-000000000bad": {"start": now, "stop": None}})
+    assert subagents.codex(ROOT, now) is None  # no file anywhere: nothing to show
+
+
 def test_codex_kind_from_the_hook_without_a_header(tmp_path, monkeypatch):
     now = time.time()
     a = tmp_path / "a.jsonl"

@@ -18,6 +18,7 @@ Each running subagent and the last RECENT that ended also get their model, last 
 message (for the panel's subagent frame), from the end of their log.
 """
 import json
+import time
 from pathlib import Path
 
 from agent_hover import agents, quota, search, states
@@ -34,6 +35,8 @@ _metas = {}     # meta file -> (mtime, data)
 _headers = {}   # Codex session file -> (root session, kind, what), or None for a main thread
 _paths = {}     # Claude session -> transcript
 _lasts = {}     # log file -> (mtime, (last tool, last message))
+_codex_files = {}  # Codex subagent ID -> its session file, found by name
+CODEX_SESSIONS = search.CODEX_SESSIONS
 _agy_seen = {}  # (conversation, index, name) -> [first seen, first seen ended or None]
 AGY_FRESH_S = 15  # a newer status-line input is trusted alone (agy's database can lag at a start)
 AGY_ENDED = {"completed", "failed", "error", "cancelled", "canceled", "killed", "stopped", "done"}
@@ -176,13 +179,31 @@ def _codex_header(path):
     return found
 
 
+def _codex_file(agent_id, start):
+    """A Codex subagent's session file by its name (rollout-<time>-<thread ID>.jsonl), in the
+    folder of its start day or the day before. For a SubagentStart that gave no path."""
+    if agent_id in _codex_files:
+        return _codex_files[agent_id]
+    if not states.ID_RE.fullmatch(str(agent_id)) or not isinstance(start, (int, float)):
+        return None
+    for day in (start, start - 86400):
+        folder = CODEX_SESSIONS / time.strftime("%Y/%m/%d", time.localtime(day))
+        found = next(iter(folder.glob(f"rollout-*-{agent_id}.jsonl")), None) if folder.is_dir() else None
+        if found:
+            _codex_files[agent_id] = str(found)
+            return str(found)
+    return None
+
+
 def codex(session, now):
     """{running, recent, done} of a Codex session from its subagent hooks, or None. A subagent
     runs while it has no SubagentStop after its last write and its last turn record is open:
     a later turn (send_input) writes again, a crash stops writing."""
     running, ended = [], []
-    for entry in states.load_codex_subagents(session).values():
-        path = entry.get("file") if isinstance(entry, dict) else None
+    for agent_id, entry in states.load_codex_subagents(session).items():
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("file") or _codex_file(agent_id, entry.get("start"))
         try:
             st = Path(path).stat()
         except (OSError, TypeError):
