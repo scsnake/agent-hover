@@ -6,6 +6,7 @@ PreToolUse: agy's own permission rules still decide).
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -19,6 +20,11 @@ IT2 = "/Applications/iTerm.app/Contents/Resources/utilities/it2"
 # iTerm2's own status words, as cc-status uses them for Claude.
 IT2_STATUS = {states.WORKING: "working", states.WAITING: "waiting",
               states.DONE: "idle", states.IDLE: "idle", states.ENDED: ""}
+# Codex 0.166.0 and later give a tool event the command's own folder as "cwd", not the session's.
+CODEX_SESSION_CWD_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
+# Codex 0.163.0 and later set the iTerm2 status themselves (OSC 21337), only outside tmux.
+CODEX_OWN_STATUS = (0, 163, 0)
+CLI_VERSION_RE = re.compile(rb'"cli_version"\s*:\s*"(\d+)\.(\d+)\.(\d+)')
 
 
 def set_iterm_status(uuid, state):
@@ -28,6 +34,32 @@ def set_iterm_status(uuid, state):
     subprocess.Popen([IT2, "session", "set-status", "--session", uuid, "--status", IT2_STATUS[state]],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
+
+
+def codex_version(transcript):
+    """(major, minor, patch) from the session_meta line of a Codex session file, or None."""
+    try:
+        with open(transcript, "rb") as f:
+            head = f.read(8192)
+    except (OSError, TypeError, ValueError):
+        return None
+    m = CLI_VERSION_RE.search(head)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def codex_sets_own_status(payload):
+    """True when this Codex sets its iTerm2 status itself: two writers would overwrite each other."""
+    if os.environ.get("TMUX"):
+        return False
+    version = codex_version(payload.get("transcript_path"))
+    return version is not None and version >= CODEX_OWN_STATUS
+
+
+def session_cwd(agent, payload):
+    """The session folder from this event, or None when the event does not give it."""
+    if agent == "codex" and payload.get("hook_event_name") not in CODEX_SESSION_CWD_EVENTS:
+        return None
+    return payload.get("cwd")
 
 
 def waiting_question(uuid, payload):
@@ -70,7 +102,7 @@ def main():
     if agent == "codex" and from_app_server():
         # Codex can run its hooks in its app-server daemon: its environment is the one of the tab
         # that started the daemon, so find the tab through the session ID or the folder instead.
-        uuid = states.codex_tab(payload.get("session_id"), payload.get("cwd"))
+        uuid = states.codex_tab(payload.get("session_id"), session_cwd(agent, payload))
     else:
         # A background job has no tab environment: find its tab through the session ID.
         uuid = states.iterm_session_uuid() or (None if agent == "agy" else states.tab_for_session(
@@ -114,13 +146,13 @@ def main():
             payload["session_id"] = main
     record = {"iterm": uuid, "agent": agent, "state": state, "detail": detail,
               "event": payload.get("hook_event_name"), "ts": now,
-              "agent_session": payload.get("session_id"), "cwd": payload.get("cwd") or prev.get("cwd")}
+              "agent_session": payload.get("session_id"), "cwd": session_cwd(agent, payload) or prev.get("cwd") or payload.get("cwd")}
     if agent == "agy":  # agy names its model and transcript in every event
         record.update(model=payload.get("model") or prev.get("model"), transcript=payload.get("transcript_path"))
     if state == states.WAITING:
         record["question"] = waiting_question(uuid, payload)
     states.write_state(uuid, record)
-    if agent == "codex":
+    if agent == "codex" and not codex_sets_own_status(payload):
         set_iterm_status(uuid, state)
 
 
