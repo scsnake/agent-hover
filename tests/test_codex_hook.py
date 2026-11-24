@@ -157,3 +157,21 @@ def test_store_keeps_the_newest_and_prunes_old_files(monkeypatch, tmp_path):
     os.utime(path, (time.time() - states.SUBAGENT_KEEP_S - 1,) * 2)
     states.prune_codex_subagents(time.time())
     assert not path.exists()
+
+
+def test_app_server_session_end_keeps_the_tab_and_its_session(monkeypatch, tmp_path):
+    calls, t = setup(monkeypatch, tmp_path)
+    send(monkeypatch, t, "Stop", "/repo")
+    monkeypatch.setattr(hook, "from_app_server", lambda: True)
+    monkeypatch.setattr(hook.states, "codex_tab", lambda sid, cwd: UUID)
+    # Codex 0.172: an app-server restart (after an update) ends its threads; the TUI goes on.
+    rec = send(monkeypatch, t, "SessionEnd", "/repo", reason="other")
+    assert (rec["state"], rec["event"], rec["detail"], rec["agent_session"]) == ("done", "SessionEnd", "app-server", SID)
+    send(monkeypatch, t, "UserPromptSubmit", "/repo")
+    assert send(monkeypatch, t, "SessionEnd", "/repo")["state"] == "idle"  # a cut turn: not working
+
+
+def test_tab_session_end_still_ends_the_tab(monkeypatch, tmp_path):
+    calls, t = setup(monkeypatch, tmp_path)
+    send(monkeypatch, t, "Stop", "/repo")
+    assert send(monkeypatch, t, "SessionEnd", "/repo")["state"] == "ended"

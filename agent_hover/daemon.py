@@ -93,7 +93,8 @@ async def seed_agents(app, known, checked):
                     if not agent and rec.get("state") != states.ENDED:
                         # No agent in the tab, but the record says one runs: it quit with no
                         # SessionEnd (crash, kill). After AGENT_GONE_S, mark the record ended.
-                        if now - rec.get("ts", now) > AGENT_GONE_S:
+                        # A Codex SessionEnd from its app-server kept the state: end it now.
+                        if now - rec.get("ts", now) > AGENT_GONE_S or rec.get("event") == "SessionEnd":
                             if (states.read_state(sid) or {}).get("ts") == rec.get("ts"):
                                 states.write_state(sid, {**rec, "state": states.ENDED, "ts": now,
                                                          "event": "agent_gone", "detail": ""})

@@ -114,7 +114,8 @@ def main():
             return
     if agent == "agy":
         payload = states.agy_payload(sys.argv[2] if len(sys.argv) > 2 else "", payload)
-    if agent == "codex" and from_app_server():
+    app_server = agent == "codex" and from_app_server()
+    if app_server:
         # Codex can run its hooks in its app-server daemon: its environment is the one of the tab
         # that started the daemon, so find the tab through the session ID or the folder instead.
         uuid = states.codex_tab(payload.get("session_id"), session_cwd(agent, payload))
@@ -141,6 +142,12 @@ def main():
         return
     state, detail = mapped
     prev = states.read_state(uuid) or {}
+    if app_server and state == states.ENDED:
+        # The app-server ends its threads when it restarts (for example after a Codex update),
+        # but the TUI in the tab goes on with the same thread. The daemon ends the record when
+        # no agent runs in the tab any more.
+        state, detail = (prev["state"] if prev.get("state") in (states.DONE, states.IDLE) else states.IDLE,
+                         "app-server")
     if (payload.get("hook_event_name") == "PostToolUse" and prev.get("state") in (states.DONE, states.IDLE)
             and prev.get("agent") == agent):
         return  # a background command can end after Stop (or after a restart seeded "idle"): no turn

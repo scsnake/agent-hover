@@ -86,3 +86,22 @@ def test_hook_record_ends_when_agent_is_gone(tmp_path, monkeypatch):
     asyncio.run(daemon.seed_agents(app, daemon.states.read_states(), checked))
     new = daemon.states.read_state("S")
     assert (new["state"], new["event"]) == ("ended", "agent_gone")
+
+
+def test_codex_app_server_session_end_ends_at_once_when_codex_quit(tmp_path, monkeypatch):
+    import asyncio
+    import time
+
+    monkeypatch.setattr(daemon.states, "STATE_DIR", tmp_path)
+    codex = Sess("S", 80, title="codex", cmd="codex")
+    app = type("A", (), {"terminal_windows": [Win([codex])]})()
+    rec = {"iterm": "S", "agent": "codex", "state": "done", "event": "SessionEnd", "detail": "app-server",
+           "agent_session": SID, "ts": time.time()}
+    daemon.states.write_state("S", rec)
+    checked = {}
+    asyncio.run(daemon.seed_agents(app, daemon.states.read_states(), checked))
+    assert daemon.states.read_state("S") == rec  # the app-server restarted: Codex still runs in the tab
+    codex.vars.update(jobPid=81, processTitle="zsh", commandLine="-zsh")  # Codex quit
+    asyncio.run(daemon.seed_agents(app, daemon.states.read_states(), checked))
+    new = daemon.states.read_state("S")
+    assert (new["state"], new["event"]) == ("ended", "agent_gone")  # no AGENT_GONE_S wait
