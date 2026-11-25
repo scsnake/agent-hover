@@ -50,6 +50,8 @@ def must_show(t):
 def parkable(t, now, cfg):
     if must_show(t):
         return False
+    if t.hidden:  # shown again although hidden (an iTerm2 restore shows every tab): bury it again
+        return not t.focused
     # Time from the later of "the person left the tab" and "the state began". So a tab that
     # just came back (done) and went to working again (a background subagent) gets a new
     # working_park_s, and is not buried again at once.

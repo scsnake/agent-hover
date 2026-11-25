@@ -139,3 +139,9 @@ def test_hidden_tab_stays_buried():
     d = run([tab("a", DONE, buried=True, hidden=True), tab("b", WAITING, buried=True, hidden=True),
              tab("c", IDLE, buried=True, hidden=True, selected=True)])
     assert d.unbury == []
+
+
+def test_hidden_tab_shown_again_is_buried_again():
+    # An iTerm2 restore shows every tab, also the hidden ones: bury them again, not the focused one.
+    d = run([tab("a", IDLE, hidden=True, age=1), tab("b", DONE, hidden=True, age=1, focused=True)])
+    assert d.bury == ["a"]

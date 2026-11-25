@@ -21,7 +21,7 @@ from pathlib import Path
 
 import iterm2
 
-from agent_hover import agents, commands, quota, remote, search, states, subagents
+from agent_hover import agents, commands, marks, quota, remote, search, states, subagents
 from agent_hover.agents import (CLAUDE_SESSIONS, CLAUDE_STATUS, CODEX_PIDS, as_pid, child_map,  # noqa: F401
                                claude_session, clean_name, codex_main_rollout, codex_turn_update,
                                agy_conversation, detect_agent, process_table, seed_record, title_state,
@@ -44,7 +44,8 @@ TYPING_QUIET_S = 3.0  # automatic unbury waits until no key was pressed for this
 REQUEST_DIR = states.HOME / "requests"
 PANEL_FILE = states.HOME / "panel.json"
 PEEK_FILE = states.HOME / "peek.json"  # last screen lines of one tab, for the panel's hover preview
-PINS_FILE = states.HOME / "pins.json"  # tabs pinned in the panel: never parked
+PINS_FILE = states.HOME / "pins.json"  # tabs pinned in the panel: never parked (marks.py)
+HIDDEN_FILE = states.HOME / "hidden.json"  # tabs hidden in the panel: buried until their state changes
 GROUP_ORDER = {states.WAITING: 0, states.DONE: 1, states.WORKING: 2, states.IDLE: 3}
 SEED_SCAN_S = 5.0
 ENDED_GRACE_S = 10.0  # an agent that wrote SessionEnd may still be the tab's job for a moment
@@ -225,18 +226,19 @@ def load_buried():
 
 
 def load_pins():
-    try:
-        data = json.loads(PINS_FILE.read_text())
-    except (OSError, ValueError):
-        return set()
-    return {s for s in data if isinstance(s, str)} if isinstance(data, list) else set()
+    return marks.Marks(PINS_FILE)
 
 
-def save_pins(pins):
-    states.HOME.mkdir(parents=True, exist_ok=True)
-    tmp = PINS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(pins)))
-    tmp.replace(PINS_FILE)
+def load_hidden():
+    return marks.Marks(HIDDEN_FILE)
+
+
+def rest_state_moved(entry, rec):
+    """A hidden tab found again after an iTerm2 restore: its new record is seeded ("idle"). If it
+    was hidden at rest (done or idle) and is at rest now, it did not change: keep it hidden."""
+    rest = (states.DONE, states.IDLE)
+    if entry.get("value") in rest and rec.get("state") in rest:
+        entry["value"] = rec["state"]
 
 
 def save_buried(data):
@@ -364,9 +366,10 @@ async def unbury(app, sid, info, keep_selection=True):
     return True
 
 
-async def bury(app, sid, focus, ours, reason, by_hand=False):
+async def bury(app, sid, focus, ours, reason, by_hand=False, selected_ok=False):
     """Bury one session after a fresh check of layout and focus. Return True if buried. by_hand
-    (the panel's hide): also the focused tab and the selected tab of its window."""
+    (the panel's hide): also the focused tab and the selected tab of its window. selected_ok (a
+    hidden tab shown again by an iTerm2 restore): also the selected tab, not the focused one."""
     await app.async_refresh()
     await focus.refresh(app)
     where, counts = layout(app)
@@ -375,7 +378,7 @@ async def bury(app, sid, focus, ours, reason, by_hand=False):
     win, tab, n_sessions, index = where[sid]
     selected = win.current_tab is not None and win.current_tab.tab_id == tab.tab_id
     why_not = ("focused" if focus.has(sid) and not by_hand
-               else "selected tab of its window" if selected and not by_hand
+               else "selected tab of its window" if selected and not (by_hand or selected_ok)
                else "split tab" if n_sessions > 1
                else "last tab of its window" if counts.get(win.window_id, 0) <= 1 else None)
     if why_not:
@@ -416,7 +419,8 @@ def write_peek_lines(sid, lines):
     tmp.replace(PEEK_FILE)
 
 
-async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hidden=None, focus=None, apply=True):
+async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hidden=None, focus=None, apply=True,
+                          pins=None):
     """Clicks from the hover panel: raise the tab (unbury if needed), select it and bring
     iTerm2 to the front. The click counts as a focus, not a pin: the normal rules apply
     from then on, so an idle tab is buried again after idle_park_s without focus.
@@ -431,6 +435,7 @@ async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hid
     A remote row (session "host:tmux-..."): "peek" reads its tmux pane, "raise" see raise_remote."""
     buried_now = {x.session_id for x in app.buried_sessions}
     hidden = {} if hidden is None else hidden
+    pins = load_pins() if pins is None else pins
     for f in pending_requests():
         try:
             req = json.loads(f.read_text())
@@ -454,9 +459,7 @@ async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hid
             await write_peek(app, sid)
             continue
         if req.get("action") in ("pin", "unpin") and sid:
-            pins = load_pins()
             (pins.add if req["action"] == "pin" else pins.discard)(sid)
-            save_pins(pins)
             if req["action"] == "pin":
                 hidden.pop(sid, None)  # a pinned tab shows again
             log(req["action"], session=sid)
@@ -467,10 +470,7 @@ async def handle_requests(app, ours, last_focus, hosts=(), remote_tabs=None, hid
                   and await bury(app, sid, focus, ours, "hide: by hand", by_hand=True))
             if ok:
                 hidden[sid] = rec["state"]
-                pins = load_pins()
-                if sid in pins:
-                    pins.discard(sid)  # hiding by hand ends a pin
-                    save_pins(pins)
+                pins.discard(sid)  # hiding by hand ends a pin
             log("hide", session=sid, ok=ok, **({} if apply else {"why": "dry run"}))
             continue
         if req.get("action") == "resume":
@@ -676,7 +676,9 @@ async def run(conn, args):
 
     started = time.time()
     last_focus, pinned, last_sig = {}, {}, None
-    hidden = {}  # session -> its state when the person hid it (panel): buried until that changes
+    # Pins and hides, saved by tab and agent session: they come back after an iTerm2 restore.
+    pins = load_pins()
+    hidden = load_hidden()  # session -> its state when the person hid it (panel): buried until that changes
     deferring = False  # automatic unburies wait while the person types
     since = {}  # session -> (state, time the daemon first saw that state)
     names, names_ts = {}, 0.0
@@ -738,33 +740,36 @@ async def run(conn, args):
                     ours.pop(sid)
                     if sid in recs:
                         pinned[sid] = recs[sid].get("state")
-                    hidden.pop(sid, None)
+                    if sid in where:  # shown by hand; a tab that is gone (iTerm2 restore) keeps its mark
+                        hidden.pop(sid, None)
                     log("manual_unbury", session=sid)
             save_buried(ours)
             for sid in list(pinned):
                 if recs.get(sid, {}).get("state") != pinned[sid]:
                     pinned.pop(sid)
+            # A restored tab has a new ID: move its marks to it (by agent session).
+            live = set(where) | buried_now
+            if live:  # an empty list may be an iTerm2 hiccup: move or drop nothing then
+                pins.sync(real, live, now, keep=remote.split_sid)
+                hidden.sync(real, live, now, moved=rest_state_moved)
             for sid in list(hidden):
+                if sid not in live:
+                    continue  # gone, or not found again yet: sync drops it after marks.GONE_S
                 state = real.get(sid, {}).get("state")
                 if state != hidden[sid]:
                     hidden.pop(sid)  # it waits, ends its turn, or starts work: show it by the rules
                     if state == states.IDLE:
                         pinned[sid] = state  # a turn that ends in idle (seeded Claude, Codex abort): show it too
                     log("hide_end", session=sid, state=state)
-            pins = load_pins()
-            if any(sid not in where and sid not in buried_now and not remote.split_sid(sid) for sid in pins):
-                pins = {sid for sid in pins if sid in where or sid in buried_now or remote.split_sid(sid)}
-                save_pins(pins)  # a local tab closed
 
             if pending_requests():
                 t = time.monotonic()
-                await handle_requests(app, ours, last_focus, hosts, remote_tabs, hidden, focus, args.apply)
+                await handle_requests(app, ours, last_focus, hosts, remote_tabs, hidden, focus, args.apply, pins)
                 parts["requests"] = time.monotonic() - t
                 await app.async_refresh()
                 await focus.refresh(app)
                 where, counts = layout(app)
                 buried_now = {x.session_id for x in app.buried_sessions}
-                pins = load_pins()  # a pin or unpin request changes it
 
             if focus.session and focus.app_active:
                 last_focus[focus.session] = now
@@ -996,7 +1001,7 @@ async def run(conn, args):
                     ours.pop(sid, None)
                     save_buried(ours)
                 for sid in d.bury:
-                    await bury(app, sid, focus, ours, d.reasons.get(sid, ""))
+                    await bury(app, sid, focus, ours, d.reasons.get(sid, ""), selected_ok=sid in hidden)
                 parts["act"] = time.monotonic() - t
             tick_s = time.monotonic() - t0
             if tick_s > SLOW_TICK_S:

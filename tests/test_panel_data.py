@@ -139,7 +139,7 @@ def test_pin_and_unpin_requests(tmp_path, monkeypatch):
     (tmp_path / "requests").mkdir()
     (tmp_path / "requests" / "a.json").write_text(json.dumps({"action": "pin", "session": "S"}))
     asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}))
-    assert daemon.load_pins() == {"S"}
+    assert set(daemon.load_pins()) == {"S"}
     # A pinned idle tab is never parked, also far past idle_park_s and over the cap.
     cfg = Config(n_active=1, idle_park_s=60, working_park_s=30, settle_s=3)
     tabs = [Tab(session=s, window="w1", state="idle", state_ts=0, state_since=0, pinned=(s == "S"))
@@ -148,7 +148,7 @@ def test_pin_and_unpin_requests(tmp_path, monkeypatch):
     assert "S" not in d.bury and {"T", "U"} <= set(d.bury)
     (tmp_path / "requests" / "b.json").write_text(json.dumps({"action": "unpin", "session": "S"}))
     asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}))
-    assert daemon.load_pins() == set()
+    assert set(daemon.load_pins()) == set()
 
 
 def test_hide_request(tmp_path, monkeypatch):
@@ -165,12 +165,12 @@ def test_hide_request(tmp_path, monkeypatch):
 
     monkeypatch.setattr(daemon, "bury", fake_bury)
     (tmp_path / "requests").mkdir()
-    daemon.save_pins({"V"})
+    daemon.load_pins().add("V")
     hidden = {}
     (tmp_path / "requests" / "a.json").write_text(json.dumps({"action": "hide", "session": "V"}))
     asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}, hidden=hidden, focus=object(), apply=True))
     assert buried == [("V", "hide: by hand", True)] and hidden == {"V": "working"}
-    assert daemon.load_pins() == set()  # hiding ends the pin
+    assert set(daemon.load_pins()) == set()  # hiding ends the pin
     # A pin shows it again.
     (tmp_path / "requests" / "b.json").write_text(json.dumps({"action": "pin", "session": "V"}))
     asyncio.run(daemon.handle_requests(FakeApp("S"), {}, {}, hidden=hidden, focus=object(), apply=True))
